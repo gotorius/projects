@@ -50,3 +50,19 @@ dp/data/
 *.jpeg
 *.txt
 
+
+# データセット
+imagenet-256/
+*.json
+# 学習済みモデル
+*.pth
+# ログ・一時ファイル
+*.csv
+*.txt
+# Jupyterのチェックポイント
+.ipynb_checkpoints/
+# Pythonキャッシュ
+__pycache__/
+*.pyc
+# VSCode設定
+.vscode/
