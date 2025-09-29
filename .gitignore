@@ -13,7 +13,8 @@ MedImages/
 # チェックポイント・モデル
 kaggledata/test/
 kaggledata/train/
-projects/Medical/MNIST
+projects/Medical/MNIST/
+projects/Medical/kaggledata/test/
 
 checkpoints/
 checkpoint_medical/
