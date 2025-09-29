@@ -1,0 +1,42 @@
+# データセット
+pcamdata/
+MedImages/
+*.h5
+*.zip
+*.tar.gz
+*.tar
+*.npz
+*.npy
+*.gz
+*.tif
+
+# チェックポイント・モデル
+kaggledata/test/
+kaggledata/train/
+projects/Medical/MNIST
+
+checkpoints/
+checkpoint_medical/
+diffusion/data
+*.pth
+*.pt
+*.t7
+
+# ログ・一時ファイル
+log_medical/
+*.log
+*.csv
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+
+# Pythonキャッシュ
+__pycache__/
+*.pyc
+
+# その他
+.DS_Store
+.env
+
+/mnt/data1/gotou/projects/Medical/diffusion/data/
+
