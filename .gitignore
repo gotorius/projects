@@ -19,6 +19,7 @@ Medical/MNIST/
 Medical/diffusion/data/
 
 checkpoints/
+
 checkpoint_medical/
 diffusion/data
 *.pth
@@ -42,4 +43,5 @@ __pycache__/
 .env
 
 /mnt/data1/gotou/projects/Medical/diffusion/data/
+dp/data/
 
