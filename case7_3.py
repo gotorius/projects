@@ -370,9 +370,9 @@ from guided_diffusion.script_util import (
 
 # ---------------- user settings ----------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-batch_size = 8 # VRAM に合わせて調整。256x256 diffusion は重いので小さめ推奨
+batch_size = 64 # VRAM に合わせて調整。256x256 diffusion は重いので小さめ推奨
 epsilon = 0.03
-num_samples = 1000 # correct_top1_images.txt の先頭何枚を使うか
+num_samples = 5000 # correct_top1_images.txt の先頭何枚を使うか
 
 # Diffusion settings
 use_ddim = True
