@@ -78,6 +78,8 @@ model = resnet50.to(device)
 criterion = nn.BCEWithLogitsLoss()
 optimizer = optim.AdamW(model.parameters(), lr=5e-5)
 
+
+"""
 # EarlyStopping & モデル保存
 class EarlyStopping:
     def __init__(self, patience=5, verbose=False, delta=0, path='best_model_weights.pth'):
@@ -114,6 +116,8 @@ class EarlyStopping:
         if self.verbose:
             print(f'Validation accuracy improved → saving model to {self.path}')
 
+            """
+
 
 # In[2]:
 
@@ -136,49 +140,6 @@ model.load_state_dict(state_dict)
 model.eval()
 
 print(f"Loaded model from {ckpt_path}")
-
-
-# In[2]:
-
-
-correct_paths = []
-
-with torch.no_grad():
-    correct, total = 0, 0
-    for batch_idx, (images, labels) in enumerate(val_loader):
-        images, labels = images.to(device), labels.to(device)
-
-        # 予測
-        outputs = model(images).squeeze()
-        preds = (torch.sigmoid(outputs) > 0.5).long()
-
-        # 正解マスク
-        correct_mask = (preds == labels.long())
-        correct += correct_mask.sum().item()
-        total += labels.size(0)
-
-        # 正解した画像のパスを取得
-        # Dataset 側で image_paths を保持している場合
-        batch_paths = [val_dataset.img_dir + "/" + val_dataset.labels.iloc[i,0] + ".tif" 
-                       for i in range(batch_idx*val_loader.batch_size, batch_idx*val_loader.batch_size + len(images))]
-        for path, is_correct in zip(batch_paths, correct_mask.cpu().numpy()):
-            if is_correct:
-                correct_paths.append(path)
-
-accuracy = correct / total * 100
-result_str = f"Validation Accuracy: {accuracy:.2f}% ({correct}/{total})"
-print(result_str)
-
-# ファイルに保存
-with open("validation_accuracy.txt", "w") as f:
-    f.write(result_str + "\n")
-
-# 正解画像パスをファイルに保存
-with open("correct_image_paths.txt", "w") as f:
-    for p in correct_paths:
-        f.write(p + "\n")
-
-print(f"Saved {len(correct_paths)} correct image paths to correct_image_paths.txt")
 
 
 # In[3]:
@@ -299,9 +260,13 @@ def fgsm_attack_improved(model, images, labels, epsilon_pixel, device,
 def evaluate_clean_and_fgsm(model, val_loader, device, epsilon_pixel, mean, std):
     adv_correct, adv_total = 0, 0
     orig_correct, orig_total = 0, 0
+    processed = 0
+    max_samples = 100  # ← 100枚に制限
 
     model.eval()
     for images, labels in val_loader:
+        if processed >= max_samples:
+            break  # ← 100枚に達したら終了
         images, labels = images.to(device), labels.to(device)
 
         # 元画像での予測
@@ -338,7 +303,87 @@ def evaluate_clean_and_fgsm(model, val_loader, device, epsilon_pixel, mean, std)
 
 
 
-# In[8]:
+# In[ ]:
+
+
+# evaluate_clean_and_fgsm(model, val_loader, device, epsilon_pixel=30/255, mean=mean, std=std)
+# original_acc, adversarial_acc = evaluate_clean_and_fgsm(model, val_loader, device, epsilon_pixel=0.01, mean=mean, std=std)
+
+
+# In[ ]:
+
+
+"""import matplotlib.pyplot as plt
+import torchvision.transforms.functional as TF
+import torch
+
+# --- 設定 ---
+num_display = 10  # 先頭何枚を可視化するか
+
+# 表示用 unnormalize（正規化 -> pixel [0,1]）
+def unnormalize_tensor(x):
+    return x * std.to(x.device) + mean.to(x.device)
+
+# データを少しだけ取得
+it = iter(val_loader)
+collected = 0
+rows = []
+
+while collected < num_display:
+    try:
+        batch = next(it)
+    except StopIteration:
+        break
+    images, labels = batch
+    B = images.shape[0]
+    take = min(B, num_display - collected)
+    imgs = images[:take].to(device)
+    labs = labels[:take].to(device)
+
+    # FGSM攻撃
+    adv_images, adv_preds = fgsm_attack_improved(
+        model, imgs, labs, epsilon_pixel=8/255, device=device,
+        mean_tensor=mean, std_tensor=std, return_preds=True
+    )
+
+    rows.append({
+        "clean": imgs.detach().cpu(),
+        "adv": adv_images.detach().cpu()
+    })
+
+    collected += take
+
+# --- 描画 ---
+plt.figure(figsize=(6, 3 * num_display))
+idx = 0
+for r in rows:
+    B = r["clean"].shape[0]
+    for i in range(B):
+        # 元画像
+        plt.subplot(num_display, 2, idx * 2 + 1)
+        img_clean = unnormalize_tensor(r["clean"][i].to(device)).cpu()
+        if img_clean.ndim == 4:
+            img_clean = img_clean.squeeze(0)
+        plt.imshow(TF.to_pil_image(img_clean))
+        plt.title("Clean")
+        plt.axis("off")
+
+        # 敵対画像
+        plt.subplot(num_display, 2, idx * 2 + 2)
+        img_adv = unnormalize_tensor(r["adv"][i].to(device)).cpu()
+        if img_adv.ndim == 4:
+            img_adv = img_adv.squeeze(0)
+        plt.imshow(TF.to_pil_image(img_adv))
+        plt.title("Adversarial")
+        plt.axis("off")
+
+        idx += 1
+
+plt.tight_layout()
+plt.show()"""
+
+
+# In[ ]:
 
 
 # fgsm_plus_diffusion_eval.py
@@ -371,13 +416,14 @@ from guided_diffusion.script_util import (
 # ---------------- user settings ----------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 batch_size = 64 # VRAM に合わせて調整。256x256 diffusion は重いので小さめ推奨
-epsilon = 0.03
+epsilon = 0.3
 num_samples = 5000 # correct_top1_images.txt の先頭何枚を使うか
 
 # Diffusion settings
 use_ddim = True
 ddim_steps = 100     # 速くしたければ 25~50。品質を優先するなら 100+
 real_step = 30     # reverse の深さ（実験して調整）
+blend_alpha = 0.6
 model_path = "/mnt/data1/gotou/projects/guided-diffusion/256x256_diffusion_uncond.pt"  # 事前チェックポイント
 
 
@@ -435,7 +481,7 @@ diff_model.eval()
 print("✅ Model loaded successfully!")
 
 
-# In[5]:
+# In[7]:
 
 
 import torch
@@ -486,7 +532,7 @@ dataloader = val_loader  # または train_loader
 
 
 
-# In[6]:
+# In[8]:
 
 
 # Purify function using diffusion (DDIM if specified)
@@ -558,7 +604,7 @@ def purify_with_diffusion(x_neg1_1, diffusion, diff_model, device,
     return recon
 
 
-# In[9]:
+# In[10]:
 
 
 from tqdm import tqdm
@@ -578,6 +624,66 @@ clean_correct = 0
 adv_correct = 0
 purified_correct = 0
 total = 0
+
+
+# In[ ]:
+
+
+"""import matplotlib.pyplot as plt
+
+for p in tqdm(paths[:5], desc="Processing images"):  # 最初の5枚だけ表示してみる
+    img_id = os.path.splitext(os.path.basename(p))[0]
+    label = labels_dict.get(img_id, None)
+    if label is None:
+        continue
+
+    img = Image.open(p).convert("RGB")
+    t = val_transform(img).unsqueeze(0).to(device)
+    label_tensor = torch.tensor([label]).to(device)
+
+    # --- 元画像で分類 ---
+    outputs_clean = model(t)
+    pred_clean = (torch.sigmoid(outputs_clean) > 0.5).long().cpu().item()
+
+    # --- 敵対的画像で分類 ---
+    adv_img, adv_pred = fgsm_attack_improved(
+        model, t, label_tensor, epsilon_pixel=0.3, device=device,
+        mean_tensor=mean, std_tensor=std, return_preds=True
+    )
+    pred_adv = adv_pred.item()
+
+    # --- 浄化 ---
+    x_01 = unnormalize(adv_img)
+    x_diff_in = prepare_for_diffusion(x_01)
+    x_purified = purify_with_diffusion(
+        x_diff_in, diffusion, diff_model, device,
+        use_ddim=True, real_step=30, blend_alpha=0.6, save_debug=False
+    )
+    x_rec_01 = recover_from_diffusion(x_purified)
+    x_rec_norm = normalize(x_rec_01)
+    outputs_purified = model(x_rec_norm)
+    pred_purified = (torch.sigmoid(outputs_purified) > 0.5).long().cpu().item()
+
+    # --- 画像を比較表示 ---
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    axes[0].imshow(img)
+    axes[0].set_title(f"Clean\nPred: {pred_clean}\nLabel: {label}")
+    axes[0].axis('off')
+
+    axes[1].imshow(unnormalize(adv_img[0]).permute(1,2,0).cpu().numpy())
+    axes[1].set_title(f"Adversarial\nPred: {pred_adv}\nLabel: {label}")
+    axes[1].axis('off')
+
+    axes[2].imshow(x_rec_01[0].permute(1,2,0).cpu().numpy())
+    axes[2].set_title(f"Purified\nPred: {pred_purified}\nLabel: {label}")
+    axes[2].axis('off')
+
+
+    plt.show()"""
+
+
+# In[11]:
+
 
 for p in tqdm(paths, desc="Processing images"):
     img_id = os.path.splitext(os.path.basename(p))[0]
