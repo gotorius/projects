@@ -416,8 +416,8 @@ from guided_diffusion.script_util import (
 # ---------------- user settings ----------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 batch_size = 64 # VRAM に合わせて調整。256x256 diffusion は重いので小さめ推奨
-epsilon = 0.3
-num_samples = 5000 # correct_top1_images.txt の先頭何枚を使うか
+epsilon = 0.01
+num_samples = 1000 # correct_top1_images.txt の先頭何枚を使うか
 
 # Diffusion settings
 use_ddim = True
@@ -703,7 +703,7 @@ for p in tqdm(paths, desc="Processing images"):
 
     # --- 敵対的画像で分類 ---
     adv_img, adv_pred = fgsm_attack_improved(
-    model, t, label_tensor, epsilon_pixel=0.3, device=device,
+    model, t, label_tensor, epsilon_pixel=0.01, device=device,
     mean_tensor=mean, std_tensor=std, return_preds=True
     )
     outputs_adv = model(adv_img)
