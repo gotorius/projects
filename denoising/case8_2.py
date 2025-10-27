@@ -1,10 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# # ImageNet事前訓練拡散モデルを医療画像分類で用いる
-
-# はじめに医療データセットに対してResNet50で分類を行う。
-# なお事前に得ていた事前訓練済みの分類機を用いる。データセットはkaggleのデータセットを用いる。
+# # 敵対的攻撃をPGDで行ってみる。
 
 # In[1]:
 
@@ -78,8 +75,6 @@ model = resnet50.to(device)
 criterion = nn.BCEWithLogitsLoss()
 optimizer = optim.AdamW(model.parameters(), lr=5e-5)
 
-
-"""
 # EarlyStopping & モデル保存
 class EarlyStopping:
     def __init__(self, patience=5, verbose=False, delta=0, path='best_model_weights.pth'):
@@ -116,8 +111,6 @@ class EarlyStopping:
         if self.verbose:
             print(f'Validation accuracy improved → saving model to {self.path}')
 
-            """
-
 
 # In[2]:
 
@@ -146,20 +139,13 @@ print(f"Loaded model from {ckpt_path}")
 
 
 import torch
-import torch.nn as nn
-
-# --- 攻撃関数 ---
 import torch.nn.functional as F
 
-import torch
-
-mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
-std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
-
-# 前提: device, mean, std が外部で定義されている（投稿の定義をそのまま使えます）
-# MEAN = np.array([...]); STD = np.array([...])
-# mean = torch.tensor(MEAN).view(1,3,1,1).to(device)
-# std  = torch.tensor(STD).view(1,3,1,1).to(device)
+# ===== 設定 (学習時の正規化と一致させる) =====
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+mean = torch.tensor(MEAN).view(1,3,1,1).to(device)
+std  = torch.tensor(STD).view(1,3,1,1).to(device)
 
 def denormalize(x, mean, std):
     # normalized -> pixel [0,1]
@@ -169,75 +155,111 @@ def renormalize(x_pixel, mean, std):
     # pixel [0,1] -> normalized
     return (x_pixel - mean) / std
 
-def fgsm_attack_improved(model, images, labels, epsilon_pixel, device,
-                         mean_tensor=None, std_tensor=None, return_preds=True):
+def pgd_attack_improved(
+    model,
+    images,
+    labels,
+    epsilon_pixel,      # scalar e.g. 8/255 or tensor shape [C]
+    alpha_pixel,        # single-step size in pixel scale (e.g. 2/255)
+    steps=10,
+    device=None,
+    mean_tensor=None,
+    std_tensor=None,
+    random_start=True,
+    return_preds=True,
+):
     """
-    FGSM attack that respects per-channel normalization.
-    Args:
-      model: nn.Module, expects normalized inputs (same normalization used here)
-      images: normalized tensor [B,C,H,W] (already normalized by mean/std)
-      labels: tensor [B] (0/1) or shape [B,1]
-      epsilon_pixel: float (e.g. 8/255) or tensor broadcastable to channels (pixel-scale)
-      device: torch.device
-      mean_tensor, std_tensor: tensors shaped [1,C,1,1] on device (if None, must be global)
-      return_preds: if True, also return predicted labels on adversarial images
+    PGD (L_inf) attack that respects per-channel normalization.
+    - images: normalized tensor [B,C,H,W]
+    - labels: tensor [B] (0/1) or shape [B,1]
+    - epsilon_pixel, alpha_pixel: pixel-scale floats (0..1) or 1D tensor per channel
+    - steps: number of PGD iterations
+    - random_start: initialize inside L_inf-ball uniformly
     Returns:
-      adv_images: tensor [B,C,H,W] (normalized, detached)
-      adv_preds (optional): LongTensor [B] predicted labels on adv_images (cpu)
+      adv_images (normalized, detached) and adv_preds (cpu LongTensor) if return_preds True
     """
-    # use provided mean/std or expect global variables `mean`/`std`
+    # use provided mean/std or globals
     if mean_tensor is None or std_tensor is None:
-        # these should exist in your scope (as in your snippet)
         mean_tensor_local = mean
         std_tensor_local = std
     else:
         mean_tensor_local = mean_tensor
         std_tensor_local = std_tensor
 
+    if device is None:
+        device = images.device
+
     images = images.clone().detach().to(device)
     labels = labels.clone().detach().to(device)
-    images.requires_grad = True
 
-    # model output: assume logits for binary classification -> shape [B] or [B,1]
-    outputs = model(images)
-    if outputs.ndim > 1 and outputs.shape[1] == 1:
-        outputs = outputs.squeeze(1)  # [B]
-    # binary cross entropy with logits
-    loss = F.binary_cross_entropy_with_logits(outputs, labels.float())
-    model.zero_grad()
-    loss.backward()
-    grad = images.grad.data  # gradient in normalized space
+    B, C, H, W = images.shape
 
-    # sign of gradient in normalized space
-    grad_sign = grad.sign()
+    # convert eps and alpha to tensors on device and pixel space shape [1,C,1,1]
+    def _to_channel_tensor(x):
+        if not torch.is_tensor(x):
+            t = torch.tensor(x, dtype=images.dtype, device=device)
+        else:
+            t = x.to(device).to(images.dtype)
+        if t.ndim == 0:
+            t = t.view(1, 1, 1, 1)  # scalar -> broadcastable
+        elif t.ndim == 1 and t.numel() == C:
+            t = t.view(1, C, 1, 1)
+        else:
+            # assume broadcastable already
+            t = t.view(1, -1, 1, 1)
+        return t
 
-    # convert epsilon_pixel (pixel scale: 0..1) -> normalized-space epsilon per channel
-    # support scalar epsilon_pixel or iterable per-channel
-    if not torch.is_tensor(epsilon_pixel):
-        eps_pixel_tensor = torch.tensor(epsilon_pixel, dtype=images.dtype, device=device)
+    eps_pixel_t = _to_channel_tensor(epsilon_pixel)   # pixel scale
+    alpha_pixel_t = _to_channel_tensor(alpha_pixel)   # pixel scale
+
+    # convert to normalized-space epsilon/alpha
+    eps_norm = eps_pixel_t / std_tensor_local.to(images.dtype)
+    alpha_norm = alpha_pixel_t / std_tensor_local.to(images.dtype)
+
+    # get pixel-space original images
+    orig_pixel = denormalize(images, mean_tensor_local, std_tensor_local)  # [B,C,H,W], pixel in [0,1]
+
+    # random start (in pixel space) then renormalize
+    if random_start:
+        # uniform perturbation in [-eps, eps] per channel
+        uni = torch.empty_like(orig_pixel).uniform_(-1.0, 1.0)
+        # scale to [-eps, eps] per channel
+        rand_pert = uni * eps_pixel_t
+        adv_pixel = torch.clamp(orig_pixel + rand_pert, 0.0, 1.0)
+        adv_images = renormalize(adv_pixel, mean_tensor_local, std_tensor_local).detach()
     else:
-        eps_pixel_tensor = epsilon_pixel.to(device).to(images.dtype)
+        adv_images = images.clone().detach()
 
-    # make eps_norm shaped [1,C,1,1]
-    if eps_pixel_tensor.ndim == 0:
-        eps_norm = (eps_pixel_tensor / std_tensor_local).view(1, -1, 1, 1)
-    elif eps_pixel_tensor.ndim == 1 and eps_pixel_tensor.numel() == std_tensor_local.shape[1]:
-        eps_norm = (eps_pixel_tensor.view(1, -1, 1, 1) / std_tensor_local)
-    else:
-        # fallback: try to broadcast
-        eps_norm = (eps_pixel_tensor / std_tensor_local)
+    # main loop
+    adv_images = adv_images.to(device)
+    for _ in range(steps):
+        adv_images.requires_grad = True
+        outputs = model(adv_images)
+        if outputs.ndim > 1 and outputs.shape[1] == 1:
+            outputs = outputs.squeeze(1)
+        loss = F.binary_cross_entropy_with_logits(outputs, labels.float())
+        model.zero_grad()
+        loss.backward()
+        grad = adv_images.grad.data
 
-    # create adversarial images in normalized space
-    adv_images = images + eps_norm * grad_sign
+        # sign update in normalized space
+        adv_images = adv_images + alpha_norm * grad.sign()
 
-    # clamp in pixel space
-    adv_pixel = denormalize(adv_images, mean_tensor_local, std_tensor_local)
-    adv_pixel = torch.clamp(adv_pixel, 0.0, 1.0)
+        # project back to L_inf ball around original pixel image:
+        # compute pixel space, clamp difference to [-eps_pixel, eps_pixel]
+        adv_pixel = denormalize(adv_images, mean_tensor_local, std_tensor_local)
+        eta = torch.clamp(adv_pixel - orig_pixel, min=-eps_pixel_t, max=eps_pixel_t)
+        adv_pixel = torch.clamp(orig_pixel + eta, 0.0, 1.0)
 
-    # back to normalized space
-    adv_images = renormalize(adv_pixel, mean_tensor_local, std_tensor_local).detach()
-    adv_images.requires_grad = False
+        # back to normalized space and detach for next iter
+        adv_images = renormalize(adv_pixel, mean_tensor_local, std_tensor_local).detach()
 
+        # cleanup grad
+        adv_images.requires_grad = False
+        del grad, outputs, loss, eta, adv_pixel
+        torch.cuda.empty_cache()
+
+    # return preds if requested
     if return_preds:
         with torch.no_grad():
             adv_out = model(adv_images)
@@ -245,142 +267,105 @@ def fgsm_attack_improved(model, images, labels, epsilon_pixel, device,
                 adv_out = adv_out.squeeze(1)
             adv_probs = torch.sigmoid(adv_out)
             adv_preds = (adv_probs > 0.5).long().cpu()
-        # cleanup
-        del grad, grad_sign, adv_out, adv_pixel, eps_norm, eps_pixel_tensor, loss
-        torch.cuda.empty_cache()
         return adv_images, adv_preds
 
-    # cleanup
-    del grad, grad_sign, adv_pixel, eps_norm, eps_pixel_tensor, loss
-    torch.cuda.empty_cache()
     return adv_images
 
 
-# --- 評価関数 ---
-def evaluate_clean_and_fgsm(model, val_loader, device, epsilon_pixel, mean, std):
+# --- 評価ループ（PGD版） ---
+def evaluate_clean_and_pgd(model, val_loader, device, epsilon_pixel=8/255, alpha_pixel=2/255, steps=10,
+                           mean=mean, std=std, attack_only_correct=False, random_start=True):
+    """
+    attack_only_correct: if True, only attack samples that the model originally classifies correctly
+    returns: (orig_acc, adv_acc) percentages (on evaluated subset)
+    """
     adv_correct, adv_total = 0, 0
     orig_correct, orig_total = 0, 0
-    processed = 0
-    max_samples = 100  # ← 100枚に制限
 
     model.eval()
-    for images, labels in val_loader:
-        if processed >= max_samples:
-            break  # ← 100枚に達したら終了
+
+    # tqdmで進捗バーを表示
+    pbar = tqdm(val_loader, desc=f"PGD attack ({steps} steps)", ncols=100)
+    for images, labels in pbar:
         images, labels = images.to(device), labels.to(device)
 
-        # 元画像での予測
+        # original predictions
         outputs = model(images)
         if outputs.ndim > 1 and outputs.shape[1] == 1:
             outputs = outputs.squeeze(1)
         preds = (torch.sigmoid(outputs) > 0.5).long()
 
-        correct_mask = (preds == labels.long())
-        if correct_mask.sum() == 0:
-            continue
+        if attack_only_correct:
+            correct_mask = (preds == labels.long())
+            if correct_mask.sum() == 0:
+                continue
+            images_to_attack = images[correct_mask]
+            labels_to_attack = labels[correct_mask]
+            # accumulate orig stats on selected subset
+            orig_preds = preds[correct_mask]
+            orig_correct += (orig_preds == labels_to_attack.long()).sum().item()
+            orig_total += labels_to_attack.size(0)
+        else:
+            images_to_attack = images
+            labels_to_attack = labels
+            orig_correct += (preds == labels.long()).sum().item()
+            orig_total += labels.size(0)
 
-        correct_images = images[correct_mask]
-        correct_labels = labels[correct_mask]
-
-        orig_preds = preds[correct_mask]
-        orig_correct += (orig_preds == correct_labels).sum().item()
-        orig_total += correct_labels.size(0)
-
-        # FGSM攻撃（正規化対応版）
-        adv_images, adv_preds = fgsm_attack_improved(
-            model, correct_images, correct_labels, epsilon_pixel, device,
-            mean_tensor=mean, std_tensor=std, return_preds=True
+        # run PGD
+        adv_images, adv_preds = pgd_attack_improved(
+            model,
+            images_to_attack,
+            labels_to_attack,
+            epsilon_pixel=epsilon_pixel,
+            alpha_pixel=alpha_pixel,
+            steps=steps,
+            device=device,
+            mean_tensor=mean,
+            std_tensor=std,
+            random_start=random_start,
+            return_preds=True
         )
-        adv_correct += (adv_preds == correct_labels.cpu()).sum().item()
-        adv_total += correct_labels.size(0)
 
-    orig_acc = orig_correct / orig_total * 100 if orig_total > 0 else 0
-    adv_acc = adv_correct / adv_total * 100 if adv_total > 0 else 0
-    print(f"Original Accuracy (on selected correct samples): {orig_acc:.2f}% ({orig_correct}/{orig_total})")
-    print(f"Adversarial Accuracy (on originally correct samples): {adv_acc:.2f}% ({adv_correct}/{adv_total})")
+        adv_correct += (adv_preds == labels_to_attack.cpu()).sum().item()
+        adv_total += labels_to_attack.size(0)
+
+    orig_acc = orig_correct / orig_total * 100 if orig_total > 0 else 0.0
+    adv_acc = adv_correct / adv_total * 100 if adv_total > 0 else 0.0
+    print(f"Original Accuracy (evaluated subset): {orig_acc:.2f}% ({orig_correct}/{orig_total})")
+    print(f"PGD Adversarial Accuracy: {adv_acc:.2f}% ({adv_correct}/{adv_total})")
     return orig_acc, adv_acc
 
 
-
-
 # In[ ]:
 
 
-# evaluate_clean_and_fgsm(model, val_loader, device, epsilon_pixel=30/255, mean=mean, std=std)
-# original_acc, adversarial_acc = evaluate_clean_and_fgsm(model, val_loader, device, epsilon_pixel=0.01, mean=mean, std=std)
+"""import torch
+from torch.utils.data import Subset, DataLoader
 
+# 先頭10サンプルのインデックス
+n = 100
+subset_idx = list(range(n))
 
-# In[ ]:
+# 元のデータセットから Subset を作る
+subset_dataset = Subset(val_loader.dataset, subset_idx)
 
+# 元の loader の設定を引き継いで DataLoader を作成
+subset_loader = DataLoader(
+    subset_dataset,
+    batch_size=val_loader.batch_size,
+    shuffle=False,                # 評価なら False が普通
+    num_workers=val_loader.num_workers,
+    pin_memory=getattr(val_loader, 'pin_memory', False)
+)
 
-"""import matplotlib.pyplot as plt
-import torchvision.transforms.functional as TF
-import torch
+# 先頭10枚だけで評価（全データ・攻撃のみ・両方に使える）
+evaluate_clean_and_pgd(model, subset_loader, device,
+                       epsilon_pixel=8/255, alpha_pixel=2/255, steps=10,
+                       mean=mean, std=std, attack_only_correct=False, random_start=True)
 
-# --- 設定 ---
-num_display = 10  # 先頭何枚を可視化するか
-
-# 表示用 unnormalize（正規化 -> pixel [0,1]）
-def unnormalize_tensor(x):
-    return x * std.to(x.device) + mean.to(x.device)
-
-# データを少しだけ取得
-it = iter(val_loader)
-collected = 0
-rows = []
-
-while collected < num_display:
-    try:
-        batch = next(it)
-    except StopIteration:
-        break
-    images, labels = batch
-    B = images.shape[0]
-    take = min(B, num_display - collected)
-    imgs = images[:take].to(device)
-    labs = labels[:take].to(device)
-
-    # FGSM攻撃
-    adv_images, adv_preds = fgsm_attack_improved(
-        model, imgs, labs, epsilon_pixel=8/255, device=device,
-        mean_tensor=mean, std_tensor=std, return_preds=True
-    )
-
-    rows.append({
-        "clean": imgs.detach().cpu(),
-        "adv": adv_images.detach().cpu()
-    })
-
-    collected += take
-
-# --- 描画 ---
-plt.figure(figsize=(6, 3 * num_display))
-idx = 0
-for r in rows:
-    B = r["clean"].shape[0]
-    for i in range(B):
-        # 元画像
-        plt.subplot(num_display, 2, idx * 2 + 1)
-        img_clean = unnormalize_tensor(r["clean"][i].to(device)).cpu()
-        if img_clean.ndim == 4:
-            img_clean = img_clean.squeeze(0)
-        plt.imshow(TF.to_pil_image(img_clean))
-        plt.title("Clean")
-        plt.axis("off")
-
-        # 敵対画像
-        plt.subplot(num_display, 2, idx * 2 + 2)
-        img_adv = unnormalize_tensor(r["adv"][i].to(device)).cpu()
-        if img_adv.ndim == 4:
-            img_adv = img_adv.squeeze(0)
-        plt.imshow(TF.to_pil_image(img_adv))
-        plt.title("Adversarial")
-        plt.axis("off")
-
-        idx += 1
-
-plt.tight_layout()
-plt.show()"""
+evaluate_clean_and_pgd(model, subset_loader, device,
+                       epsilon_pixel=8/255, alpha_pixel=2/255, steps=10,
+                       mean=mean, std=std, attack_only_correct=True, random_start=True)"""
 
 
 # In[ ]:
@@ -416,7 +401,7 @@ from guided_diffusion.script_util import (
 # ---------------- user settings ----------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 batch_size = 64 # VRAM に合わせて調整。256x256 diffusion は重いので小さめ推奨
-epsilon = 0.01
+epsilon = 0.3
 num_samples = 1000 # correct_top1_images.txt の先頭何枚を使うか
 
 # Diffusion settings
@@ -481,7 +466,7 @@ diff_model.eval()
 print("✅ Model loaded successfully!")
 
 
-# In[7]:
+# In[6]:
 
 
 import torch
@@ -532,7 +517,7 @@ dataloader = val_loader  # または train_loader
 
 
 
-# In[8]:
+# In[7]:
 
 
 # Purify function using diffusion (DDIM if specified)
@@ -604,34 +589,36 @@ def purify_with_diffusion(x_neg1_1, diffusion, diff_model, device,
     return recon
 
 
-# In[10]:
+# In[ ]:
 
 
+from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
 import pandas as pd
 from PIL import Image
 import os
+import torch
+import numpy as np
 
-# ラベルCSVを読み込み
+# --- ラベルCSVの読み込み ---
 labels_df = pd.read_csv('/mnt/data1/gotou/projects/Medical/kaggledata/train_labels.csv')
 labels_dict = dict(zip(labels_df['id'], labels_df['label']))
 
+# --- 攻撃対象画像リスト ---
 with open("/mnt/data1/gotou/kaggle/path/correct_image_paths.txt") as f:
     all_paths = [p.strip() for p in f]
 paths = all_paths[:num_samples]
 
-clean_correct = 0
-adv_correct = 0
-purified_correct = 0
-total = 0
+clean_correct = adv_correct = purified_correct = total = 0
 
+# 混同行列用に保存
+y_true = []
+y_pred_clean = []
+y_pred_adv = []
+y_pred_purified = []
 
-# In[ ]:
-
-
-"""import matplotlib.pyplot as plt
-
-for p in tqdm(paths[:5], desc="Processing images"):  # 最初の5枚だけ表示してみる
+# === ループ ===
+for p in tqdm(paths, desc="Processing images"):
     img_id = os.path.splitext(os.path.basename(p))[0]
     label = labels_dict.get(img_id, None)
     if label is None:
@@ -641,18 +628,27 @@ for p in tqdm(paths[:5], desc="Processing images"):  # 最初の5枚だけ表示
     t = val_transform(img).unsqueeze(0).to(device)
     label_tensor = torch.tensor([label]).to(device)
 
-    # --- 元画像で分類 ---
+    # --- 元画像 ---
     outputs_clean = model(t)
     pred_clean = (torch.sigmoid(outputs_clean) > 0.5).long().cpu().item()
 
-    # --- 敵対的画像で分類 ---
-    adv_img, adv_pred = fgsm_attack_improved(
-        model, t, label_tensor, epsilon_pixel=0.3, device=device,
-        mean_tensor=mean, std_tensor=std, return_preds=True
+    # --- PGD攻撃 ---
+    adv_img, adv_pred = pgd_attack_improved(
+        model=model,
+        images=t,
+        labels=label_tensor,
+        epsilon_pixel=8/255,
+        alpha_pixel=2/255,
+        steps=10,
+        device=device,
+        mean_tensor=mean,
+        std_tensor=std,
+        random_start=True,
+        return_preds=True
     )
     pred_adv = adv_pred.item()
 
-    # --- 浄化 ---
+    # --- guided-diffusionで浄化 ---
     x_01 = unnormalize(adv_img)
     x_diff_in = prepare_for_diffusion(x_01)
     x_purified = purify_with_diffusion(
@@ -664,70 +660,123 @@ for p in tqdm(paths[:5], desc="Processing images"):  # 最初の5枚だけ表示
     outputs_purified = model(x_rec_norm)
     pred_purified = (torch.sigmoid(outputs_purified) > 0.5).long().cpu().item()
 
-    # --- 画像を比較表示 ---
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    axes[0].imshow(img)
-    axes[0].set_title(f"Clean\nPred: {pred_clean}\nLabel: {label}")
-    axes[0].axis('off')
-
-    axes[1].imshow(unnormalize(adv_img[0]).permute(1,2,0).cpu().numpy())
-    axes[1].set_title(f"Adversarial\nPred: {pred_adv}\nLabel: {label}")
-    axes[1].axis('off')
-
-    axes[2].imshow(x_rec_01[0].permute(1,2,0).cpu().numpy())
-    axes[2].set_title(f"Purified\nPred: {pred_purified}\nLabel: {label}")
-    axes[2].axis('off')
-
-
-    plt.show()"""
-
-
-# In[11]:
-
-
-for p in tqdm(paths, desc="Processing images"):
-    img_id = os.path.splitext(os.path.basename(p))[0]
-    label = labels_dict.get(img_id, None)
-    if label is None:
-        continue  # ラベルが見つからない場合はスキップ
-
-    img = Image.open(p).convert("RGB")
-    t = val_transform(img).unsqueeze(0).to(device)
-    label_tensor = torch.tensor([label]).to(device)
-
-    # --- 元画像で分類 ---
-    outputs_clean = model(t)
-    pred_clean = (torch.sigmoid(outputs_clean) > 0.5).long().cpu().item()
+    # --- 正解数カウント ---
     if pred_clean == label:
         clean_correct += 1
-
-    # --- 敵対的画像で分類 ---
-    adv_img, adv_pred = fgsm_attack_improved(
-    model, t, label_tensor, epsilon_pixel=0.01, device=device,
-    mean_tensor=mean, std_tensor=std, return_preds=True
-    )
-    outputs_adv = model(adv_img)
-    pred_adv = adv_pred.item()  # 1枚の場合
     if pred_adv == label:
         adv_correct += 1
-        
-    # --- guided-diffusionで浄化後分類 ---
-    x_01 = unnormalize(adv_img)
-    x_diff_in = prepare_for_diffusion(x_01)
-    x_purified = purify_with_diffusion(
-        x_diff_in, diffusion, diff_model, device,
-        use_ddim=True, real_step=30, blend_alpha=0.6, save_debug=False
-    )
-    x_rec_01 = recover_from_diffusion(x_purified)
-    x_rec_norm = normalize(x_rec_01)
-    outputs_purified = model(x_rec_norm)
-    pred_purified = (torch.sigmoid(outputs_purified) > 0.5).long().cpu().item()
     if pred_purified == label:
         purified_correct += 1
 
     total += 1
 
-print(f"Clean Accuracy: {clean_correct/total*100:.2f}% ({clean_correct}/{total})")
-print(f"Adversarial Accuracy: {adv_correct/total*100:.2f}% ({adv_correct}/{total})")
+    # --- 混同行列用データ保存 ---
+    y_true.append(label)
+    y_pred_clean.append(pred_clean)
+    y_pred_adv.append(pred_adv)
+    y_pred_purified.append(pred_purified)
+
+# --- 精度出力 ---
+print(f"\nClean Accuracy: {clean_correct/total*100:.2f}% ({clean_correct}/{total})")
+print(f"Adversarial Accuracy (PGD): {adv_correct/total*100:.2f}% ({adv_correct}/{total})")
 print(f"Purified Accuracy: {purified_correct/total*100:.2f}% ({purified_correct}/{total})")
+
+# --- 混同行列をテキスト出力 ---
+def print_confusion_matrix(y_true, y_pred, title):
+    cm = confusion_matrix(y_true, y_pred)
+    print(f"\n{title}")
+    print(pd.DataFrame(
+        cm,
+        index=["True Normal (0)", "True Tumor (1)"],
+        columns=["Pred Normal (0)", "Pred Tumor (1)"]
+    ))
+
+print_confusion_matrix(y_true, y_pred_clean, "Confusion Matrix - Clean Images")
+print_confusion_matrix(y_true, y_pred_adv, "Confusion Matrix - Adversarial (PGD) Images")
+print_confusion_matrix(y_true, y_pred_purified, "Confusion Matrix - Purified Images")
+
+
+# In[ ]:
+
+
+"""import torch
+from PIL import Image
+import matplotlib.pyplot as plt
+import torchvision.transforms.functional as TF
+from tqdm import tqdm
+import os
+
+# === 表示設定 ===
+num_visualize = 5  # 表示するサンプル数
+
+# --- 攻撃対象画像リスト ---
+with open("correct_image_paths.txt") as f:
+    all_paths = [p.strip() for p in f]
+paths = all_paths[:num_visualize]
+
+# === Figure全体を準備 ===
+fig, axes = plt.subplots(num_visualize, 3, figsize=(9, 3 * num_visualize))
+if num_visualize == 1:
+    axes = [axes]  # 1枚だけの時でもループできるように
+
+for row_idx, p in enumerate(tqdm(paths, desc="Visualizing samples")):
+    img_id = os.path.splitext(os.path.basename(p))[0]
+    label = labels_dict.get(img_id, None)
+    if label is None:
+        continue
+
+    # === Clean ===
+    img = Image.open(p).convert("RGB")
+    t = val_transform(img).unsqueeze(0).to(device)
+    outputs_clean = model(t)
+    pred_clean = (torch.sigmoid(outputs_clean) > 0.5).long().cpu().item()
+    clean_img_vis = unnormalize(t)
+
+    # === Adversarial ===
+    adv_img, adv_pred = pgd_attack_improved(
+        model=model,
+        images=t,
+        labels=torch.tensor([label]).to(device),
+        epsilon_pixel=8/255,
+        alpha_pixel=2/255,
+        steps=10,
+        device=device,
+        mean_tensor=mean,
+        std_tensor=std,
+        random_start=True,
+        return_preds=True
+    )
+    pred_adv = adv_pred.item()
+    adv_img_vis = unnormalize(adv_img)
+
+    # === Purified ===
+    x_01 = unnormalize(adv_img)
+    x_diff_in = prepare_for_diffusion(x_01)
+    x_purified = purify_with_diffusion(
+        x_diff_in, diffusion, diff_model, device,
+        use_ddim=True, real_step=30, blend_alpha=0.6, save_debug=False
+    )
+    x_rec_01 = recover_from_diffusion(x_purified)
+    pur_img_vis = x_rec_01
+    outputs_pur = model(normalize(x_rec_01))
+    pred_pur = (torch.sigmoid(outputs_pur) > 0.5).long().cpu().item()
+
+    # === 各列に表示 ===
+    titles = [
+        f"Clean\npred={pred_clean}",
+        f"Adversarial\npred={pred_adv}",
+        f"Purified\npred={pred_pur}"
+    ]
+    imgs = [clean_img_vis, adv_img_vis, pur_img_vis]
+
+    for col_idx in range(3):
+        ax = axes[row_idx][col_idx] if num_visualize > 1 else axes[col_idx]
+        ax.imshow(TF.to_pil_image(imgs[col_idx][0].cpu()))
+        ax.set_title(titles[col_idx], fontsize=10)
+        ax.axis("off")
+
+    axes[row_idx][0].set_ylabel(f"Sample {row_idx+1}\nLabel={label}", fontsize=10)
+
+plt.tight_layout()
+plt.show()"""
 
