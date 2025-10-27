@@ -59,6 +59,8 @@ imagenet-256/
 # ログ・一時ファイル
 *.csv
 *.txt
+*.png
+
 # Jupyterのチェックポイント
 .ipynb_checkpoints/
 # Pythonキャッシュ

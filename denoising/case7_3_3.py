@@ -142,7 +142,7 @@ model.eval()
 print(f"Loaded model from {ckpt_path}")
 
 
-# In[3]:
+# In[4]:
 
 
 import torch
@@ -416,7 +416,7 @@ from guided_diffusion.script_util import (
 # ---------------- user settings ----------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 batch_size = 64 # VRAM に合わせて調整。256x256 diffusion は重いので小さめ推奨
-epsilon = 0.01
+epsilon = 8/255
 num_samples = 1000 # correct_top1_images.txt の先頭何枚を使うか
 
 # Diffusion settings
@@ -481,7 +481,7 @@ diff_model.eval()
 print("✅ Model loaded successfully!")
 
 
-# In[7]:
+# In[6]:
 
 
 import torch
@@ -532,7 +532,7 @@ dataloader = val_loader  # または train_loader
 
 
 
-# In[8]:
+# In[7]:
 
 
 # Purify function using diffusion (DDIM if specified)
@@ -604,7 +604,7 @@ def purify_with_diffusion(x_neg1_1, diffusion, diff_model, device,
     return recon
 
 
-# In[10]:
+# In[8]:
 
 
 from tqdm import tqdm
@@ -647,7 +647,7 @@ for p in tqdm(paths[:5], desc="Processing images"):  # 最初の5枚だけ表示
 
     # --- 敵対的画像で分類 ---
     adv_img, adv_pred = fgsm_attack_improved(
-        model, t, label_tensor, epsilon_pixel=0.3, device=device,
+        model, t, label_tensor, epsilon_pixel=8/255, device=device,
         mean_tensor=mean, std_tensor=std, return_preds=True
     )
     pred_adv = adv_pred.item()
@@ -679,39 +679,55 @@ for p in tqdm(paths[:5], desc="Processing images"):  # 最初の5枚だけ表示
     axes[2].axis('off')
 
 
-    plt.show()"""
+    plt.show()
+"""
 
 
-# In[11]:
+# In[12]:
 
+
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+import torch
+import numpy as np
+from tqdm import tqdm
+from PIL import Image
+import os
+
+from sklearn.metrics import confusion_matrix
+import numpy as np
+
+
+# --- 結果格納 ---
+y_true = []
+y_pred_clean = []
+y_pred_adv = []
+y_pred_purified = []
+
+clean_correct = adv_correct = purified_correct = total = 0
 
 for p in tqdm(paths, desc="Processing images"):
     img_id = os.path.splitext(os.path.basename(p))[0]
     label = labels_dict.get(img_id, None)
     if label is None:
-        continue  # ラベルが見つからない場合はスキップ
+        continue
 
     img = Image.open(p).convert("RGB")
     t = val_transform(img).unsqueeze(0).to(device)
     label_tensor = torch.tensor([label]).to(device)
 
-    # --- 元画像で分類 ---
+    # --- 元画像 ---
     outputs_clean = model(t)
     pred_clean = (torch.sigmoid(outputs_clean) > 0.5).long().cpu().item()
-    if pred_clean == label:
-        clean_correct += 1
 
-    # --- 敵対的画像で分類 ---
+    # --- 敵対的画像 ---
     adv_img, adv_pred = fgsm_attack_improved(
-    model, t, label_tensor, epsilon_pixel=0.01, device=device,
-    mean_tensor=mean, std_tensor=std, return_preds=True
+        model, t, label_tensor, epsilon_pixel=8/255,
+        device=device, mean_tensor=mean, std_tensor=std, return_preds=True
     )
-    outputs_adv = model(adv_img)
-    pred_adv = adv_pred.item()  # 1枚の場合
-    if pred_adv == label:
-        adv_correct += 1
-        
-    # --- guided-diffusionで浄化後分類 ---
+    pred_adv = adv_pred.item()
+
+    # --- guided-diffusionで浄化 ---
     x_01 = unnormalize(adv_img)
     x_diff_in = prepare_for_diffusion(x_01)
     x_purified = purify_with_diffusion(
@@ -722,12 +738,48 @@ for p in tqdm(paths, desc="Processing images"):
     x_rec_norm = normalize(x_rec_01)
     outputs_purified = model(x_rec_norm)
     pred_purified = (torch.sigmoid(outputs_purified) > 0.5).long().cpu().item()
+
+    # --- 正解数カウント ---
+    if pred_clean == label:
+        clean_correct += 1
+    if pred_adv == label:
+        adv_correct += 1
     if pred_purified == label:
         purified_correct += 1
 
     total += 1
 
+    # --- 混同行列用に保存 ---
+    y_true.append(label)
+    y_pred_clean.append(pred_clean)
+    y_pred_adv.append(pred_adv)
+    y_pred_purified.append(pred_purified)
+
+# --- 精度出力 ---
 print(f"Clean Accuracy: {clean_correct/total*100:.2f}% ({clean_correct}/{total})")
 print(f"Adversarial Accuracy: {adv_correct/total*100:.2f}% ({adv_correct}/{total})")
 print(f"Purified Accuracy: {purified_correct/total*100:.2f}% ({purified_correct}/{total})")
+
+from sklearn.metrics import confusion_matrix
+import numpy as np
+
+def print_confusion(y_true, y_pred, title):
+    cm = confusion_matrix(y_true, y_pred)
+    tn, fp, fn, tp = cm.ravel()  # 2クラスの場合
+    acc = (tp + tn) / cm.sum()
+    print(f"\n=== {title} ===")
+    print("Confusion Matrix (rows=TrueLabel, cols=PredLabel)")
+    print("          Pred:0   Pred:1")
+    print(f"True:0    {tn:6d}   {fp:6d}")
+    print(f"True:1    {fn:6d}   {tp:6d}")
+    print(f"Accuracy: {acc*100:.2f}%")
+    print(f"Sensitivity (TPR): {tp/(tp+fn+1e-8):.3f}")
+    print(f"Specificity (TNR): {tn/(tn+fp+1e-8):.3f}")
+    return cm
+
+# --- 各ケースで混同行列を出力 ---
+cm_clean = print_confusion(y_true, y_pred_clean, "Clean Images")
+cm_adv = print_confusion(y_true, y_pred_adv, "Adversarial Images")
+cm_purified = print_confusion(y_true, y_pred_purified, "Purified Images")
+
 
