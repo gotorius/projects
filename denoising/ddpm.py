@@ -85,7 +85,7 @@ alphas_cumprod = torch.cumprod(alphas, dim=0)              # \bar{\alpha}_t
 sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
 sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
 
-# 修正版 ↓↓↓
+
 posterior_variance = torch.zeros_like(betas)
 posterior_variance[1:] = betas[1:] * (1.0 - alphas_cumprod[:-1]) / (1.0 - alphas_cumprod[1:])
 posterior_variance[0] = 1e-8
