@@ -1,14 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# # ImageNet事前訓練拡散モデルを医療画像分類で用いる
-
-# はじめに医療データセットに対してResNet50で分類を行う。
-# なお事前に得ていた事前訓練済みの分類機を用いる。データセットはkaggleのデータセットを用いる。
-
-# In[1]:
-
-
 import copy
 import torch
 import torch.nn as nn
