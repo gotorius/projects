@@ -263,7 +263,10 @@ def q_sample(x_start, t, noise=None):
 
 # p_sample step (one reverse step)
 def p_sample(model, x_t, t):
-    # t: scalar timestep for this call (int), but we provide batch t as tensor
+    # t: tensor of shape (B,) with same timestep for all samples in batch
+    # Extract scalar timestep value (assuming all elements in batch have same t)
+    t_scalar = t[0].item() if t.dim() > 0 else t.item()
+    
     betas_t = betas[t].view(-1,1,1,1)
     sqrt_one_minus_alphas_cumprod_t = sqrt_one_minus_alphas_cumprod[t].view(-1,1,1,1)
     sqrt_recip_alphas_t = (1.0 / torch.sqrt(alphas[t])).view(-1,1,1,1)
@@ -272,11 +275,11 @@ def p_sample(model, x_t, t):
     eps_pred = model(x_t, t)  # shape (B,C,H,W)
     # compute mean of posterior (see Ho et al., eq)
     model_mean = sqrt_recip_alphas_t * (x_t - betas_t / sqrt_one_minus_alphas_cumprod_t * eps_pred)
-    if t.item() == 0:
+    if t_scalar == 0:
         return model_mean
     else:
         noise = torch.randn_like(x_t)
-        posterior_var_t = betas[t].view(-1,1,1,1)
+        posterior_var_t = posterior_variance[t].view(-1,1,1,1)
         return model_mean + torch.sqrt(posterior_var_t) * noise
 
 @torch.no_grad()
