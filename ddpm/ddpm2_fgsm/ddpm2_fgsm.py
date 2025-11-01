@@ -13,7 +13,7 @@ from PIL import Image
 import numpy as np
 from tqdm.auto import tqdm  # これを追加
 
-DATA_DIR = '/mnt/data1/gotou/projects/Medical/kaggledata'
+DATA_DIR = '/mnt/data1/gotou/kaggle/pcam'
 TRAIN_IMG_DIR = os.path.join(DATA_DIR, 'train')
 LABELS_CSV = os.path.join(DATA_DIR, 'train_labels.csv')
 TEST_IMG_DIR = os.path.join(DATA_DIR, 'test')
@@ -90,7 +90,7 @@ model.fc = nn.Linear(model.fc.in_features, 1)  # 1ユニット出力
 model = model.to(device)
 
 # 重みロード
-ckpt_path = "/mnt/data1/gotou/projects/Medical/kaggledata/best_model_weights.pth"
+ckpt_path = "/mnt/data1/gotou/kaggle/pcam/best_model_weights.pth"
 state_dict = torch.load(ckpt_path, map_location=device)
 model.load_state_dict(state_dict)
 model.eval()
@@ -241,8 +241,8 @@ import numpy as np
 # ---------- Basic device / paths ----------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 学習済みDDPM（ddpm.pyで学習したチェックポイント）
-ddpm_ckpt = "/mnt/data1/gotou/kaggle/denoising/ddpm2/ddpm_out/ddpm2_epoch10.pth"
-clf_ckpt  = "/mnt/data1/gotou/projects/Medical/kaggledata/best_model_weights.pth"
+ddpm_ckpt = "/mnt/data1/gotou/kaggle/denoising/ddpm2_fgsm/ddpm_out/ddpm2_epoch10.pth"
+clf_ckpt  = "/mnt/data1/gotou/kaggle/pcam/best_model_weights.pth"
 
 # --- モデル定義（ddpm.pyと一致） ---
 class SinusoidalPosEmb(nn.Module):

@@ -13,7 +13,7 @@ from PIL import Image
 import numpy as np
 from tqdm.auto import tqdm  # これを追加
 
-DATA_DIR = '/mnt/data1/gotou/projects/Medical/kaggledata'
+DATA_DIR = '/mnt/data1/gotou/kaggle/pcam'
 TRAIN_IMG_DIR = os.path.join(DATA_DIR, 'train')
 LABELS_CSV = os.path.join(DATA_DIR, 'train_labels.csv')
 TEST_IMG_DIR = os.path.join(DATA_DIR, 'test')
@@ -90,7 +90,7 @@ model.fc = nn.Linear(model.fc.in_features, 1)  # 1ユニット出力
 model = model.to(device)
 
 # 重みロード
-ckpt_path = "/mnt/data1/gotou/projects/Medical/kaggledata/best_model_weights.pth"
+ckpt_path = "/mnt/data1/gotou/kaggle/pcam/best_model_weights.pth"
 state_dict = torch.load(ckpt_path, map_location=device)
 model.load_state_dict(state_dict)
 model.eval()
@@ -241,8 +241,8 @@ import numpy as np
 # ---------- Basic device / paths ----------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 学習済みDDPM（ddpm.pyで学習したチェックポイント）
-ddpm_ckpt = "/mnt/data1/gotou/projects/Medical/kaggledata/ddpm_out/ddpm_epoch10.pth"
-clf_ckpt  = "/mnt/data1/gotou/projects/Medical/kaggledata/best_model_weights.pth"
+ddpm_ckpt = "/mnt/data1/gotou/kaggle/ddpm/ddpm1_fgsm/ddpm_epoch10.pth"
+clf_ckpt  = "/mnt/data1/gotou/kaggle/pcam/best_model_weights.pth"
 
 # --- モデル定義（ddpm.pyと一致） ---
 class SinusoidalPosEmb(nn.Module):
@@ -461,7 +461,7 @@ print("Loaded classifier and ddpm (ddpm_out epoch10).")
 epsilon_pixel = 8/255.0
 start_t = 80    # 浄化開始時刻
 T_purify = 50    # 逆拡散反復数（短縮して高速化）
-save_examples_dir = "purify_examples"
+save_examples_dir = "purify_examples2"  # 出力ディレクトリ
 os.makedirs(save_examples_dir, exist_ok=True)
 # per-image 出力用ディレクトリ
 save_triplets_dir = os.path.join(save_examples_dir, "triplets")
@@ -492,6 +492,12 @@ all_labels = []
 all_preds_clean = []
 all_preds_adv = []
 all_preds_purified = []
+
+# ノルム計算用のリスト
+l2_norms_adv = []
+linf_norms_adv = []
+l2_norms_purified = []
+linf_norms_purified = []
 
 # loop
 for batch_idx, (images_norm, labels) in enumerate(tqdm(EVAL_LOADER, desc="Eval loop (all validation images)")):
@@ -541,6 +547,15 @@ for batch_idx, (images_norm, labels) in enumerate(tqdm(EVAL_LOADER, desc="Eval l
     adv_preds_from_attack = adv_preds_from_attack.to(device)
     correct_adv += (adv_preds_from_attack.cpu() == labels_correct.cpu()).sum().item()
     all_preds_adv.extend(adv_preds_from_attack.cpu().numpy())
+    
+    # L2 と L∞ ノルムを計算（pixel space）
+    clean_pixel = unnormalize(images_norm_correct.detach())
+    adv_pixel = unnormalize(adv_images_norm.detach())
+    diff_adv = (adv_pixel - clean_pixel).view(len(correct_indices), -1)
+    l2_adv = torch.norm(diff_adv, p=2, dim=1).cpu().numpy()
+    linf_adv = torch.norm(diff_adv, p=float('inf'), dim=1).cpu().numpy()
+    l2_norms_adv.extend(l2_adv)
+    linf_norms_adv.extend(linf_adv)
 
     # 3) prepare for diffusion & purify (x0再構成で返す)
     x_adv_for_diff = prepare_for_diffusion_from_norm(adv_images_norm, target_size=224)
@@ -556,6 +571,16 @@ for batch_idx, (images_norm, labels) in enumerate(tqdm(EVAL_LOADER, desc="Eval l
         preds_pur = (probs_pur > 0.5).long()
         correct_purified += (preds_pur.cpu() == labels_correct.cpu()).sum().item()
         all_preds_purified.extend(preds_pur.cpu().numpy())
+        
+        # 浄化後のL2/L∞ノルム計算
+        pur_pixel = (purified_minus1to1.detach() + 1.0) / 2.0
+        # resize to match clean_pixel size for fair comparison
+        pur_pixel_resized = F.interpolate(pur_pixel, size=(224,224), mode="bilinear", align_corners=False)
+        diff_pur = (pur_pixel_resized - clean_pixel).view(len(correct_indices), -1)
+        l2_pur = torch.norm(diff_pur, p=2, dim=1).cpu().numpy()
+        linf_pur = torch.norm(diff_pur, p=float('inf'), dim=1).cpu().numpy()
+        l2_norms_purified.extend(l2_pur)
+        linf_norms_purified.extend(linf_pur)
 
     # 5) save per-image outputs (original/adv/purified) and triplet tiles - 最初の何枚かのみ
     if saved_image_count < MAX_IMAGES_TO_SAVE:
@@ -597,11 +622,40 @@ clean_acc = correct_clean / total if total > 0 else 0.0
 adv_acc = correct_adv / total if total > 0 else 0.0
 pur_acc = correct_purified / total if total > 0 else 0.0
 
-print("\n==== Results (Clean Images Only) ====")
+# ノルム統計
+l2_norms_adv = np.array(l2_norms_adv)
+linf_norms_adv = np.array(linf_norms_adv)
+l2_norms_purified = np.array(l2_norms_purified)
+linf_norms_purified = np.array(linf_norms_purified)
+
+print("\n" + "="*70)
+print("==== Results (Clean Images Only - FGSM Attack) ====")
+print("="*70)
 print(f"Total samples evaluated: {total} (元画像で正解したもののみ)")
+print(f"Attack: FGSM with epsilon={epsilon_pixel:.4f} ({epsilon_pixel*255:.1f}/255)")
+print(f"Purification: DDPM start_t={start_t}, T_purify={T_purify}")
+print("-"*70)
 print(f"Clean accuracy:     {clean_acc:.4f} (常に1.0)")
 print(f"Adv (FGSM) accuracy:{adv_acc:.4f}")
 print(f"Purified accuracy:  {pur_acc:.4f}")
+print(f"Defense improvement: {pur_acc - adv_acc:+.4f}")
+print("-"*70)
+
+print("\n" + "="*70)
+print("==== Perturbation Norms ====")
+print("="*70)
+print("Adversarial Perturbations (vs Clean):")
+print(f"  L2 norm:   mean={l2_norms_adv.mean():.4f}, std={l2_norms_adv.std():.4f}, "
+      f"min={l2_norms_adv.min():.4f}, max={l2_norms_adv.max():.4f}")
+print(f"  L∞ norm:   mean={linf_norms_adv.mean():.4f}, std={linf_norms_adv.std():.4f}, "
+      f"min={linf_norms_adv.min():.4f}, max={linf_norms_adv.max():.4f}")
+print("\nPurified Images (vs Clean):")
+print(f"  L2 norm:   mean={l2_norms_purified.mean():.4f}, std={l2_norms_purified.std():.4f}, "
+      f"min={l2_norms_purified.min():.4f}, max={l2_norms_purified.max():.4f}")
+print(f"  L∞ norm:   mean={linf_norms_purified.mean():.4f}, std={linf_norms_purified.std():.4f}, "
+      f"min={linf_norms_purified.min():.4f}, max={linf_norms_purified.max():.4f}")
+print("="*70)
+
 print(f"\nSaved {saved_image_count} example images to: {save_examples_dir}")
 print(f"- Individual images: {save_clean_dir}, {save_adv_dir}, {save_pur_dir}")
 print(f"- Triplets per image: {save_triplets_dir}")
@@ -673,3 +727,200 @@ plt.savefig(os.path.join(save_examples_dir, 'confusion_matrix_comparison.png'),
             dpi=150, bbox_inches='tight')
 plt.show()
 print(f"\n✅ All confusion matrices saved to: {save_examples_dir}")
+
+# ---------- ノルム分布の可視化 ----------
+print("\n" + "="*70)
+print("Generating norm distribution plots...")
+print("="*70)
+
+# L2ノルムのヒストグラム
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+# L2 ノルム - Adversarial
+axes[0, 0].hist(l2_norms_adv, bins=50, color='red', alpha=0.7, edgecolor='black')
+axes[0, 0].axvline(l2_norms_adv.mean(), color='darkred', linestyle='--', linewidth=2, label=f'Mean: {l2_norms_adv.mean():.4f}')
+axes[0, 0].set_title('L2 Norm Distribution - Adversarial Perturbations (FGSM)', fontsize=12, fontweight='bold')
+axes[0, 0].set_xlabel('L2 Norm')
+axes[0, 0].set_ylabel('Frequency')
+axes[0, 0].legend()
+axes[0, 0].grid(True, alpha=0.3)
+
+# L∞ ノルム - Adversarial
+axes[0, 1].hist(linf_norms_adv, bins=50, color='orange', alpha=0.7, edgecolor='black')
+axes[0, 1].axvline(linf_norms_adv.mean(), color='darkorange', linestyle='--', linewidth=2, label=f'Mean: {linf_norms_adv.mean():.4f}')
+axes[0, 1].set_title('L∞ Norm Distribution - Adversarial Perturbations (FGSM)', fontsize=12, fontweight='bold')
+axes[0, 1].set_xlabel('L∞ Norm')
+axes[0, 1].set_ylabel('Frequency')
+axes[0, 1].legend()
+axes[0, 1].grid(True, alpha=0.3)
+
+# L2 ノルム - Purified
+axes[1, 0].hist(l2_norms_purified, bins=50, color='blue', alpha=0.7, edgecolor='black')
+axes[1, 0].axvline(l2_norms_purified.mean(), color='darkblue', linestyle='--', linewidth=2, label=f'Mean: {l2_norms_purified.mean():.4f}')
+axes[1, 0].set_title('L2 Norm Distribution - Purified vs Clean', fontsize=12, fontweight='bold')
+axes[1, 0].set_xlabel('L2 Norm')
+axes[1, 0].set_ylabel('Frequency')
+axes[1, 0].legend()
+axes[1, 0].grid(True, alpha=0.3)
+
+# L∞ ノルム - Purified
+axes[1, 1].hist(linf_norms_purified, bins=50, color='green', alpha=0.7, edgecolor='black')
+axes[1, 1].axvline(linf_norms_purified.mean(), color='darkgreen', linestyle='--', linewidth=2, label=f'Mean: {linf_norms_purified.mean():.4f}')
+axes[1, 1].set_title('L∞ Norm Distribution - Purified vs Clean', fontsize=12, fontweight='bold')
+axes[1, 1].set_xlabel('L∞ Norm')
+axes[1, 1].set_ylabel('Frequency')
+axes[1, 1].legend()
+axes[1, 1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(os.path.join(save_examples_dir, 'norm_distributions.png'), dpi=150, bbox_inches='tight')
+plt.show()
+
+# ボックスプロット比較
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+# L2 ノルムの比較
+axes[0].boxplot([l2_norms_adv, l2_norms_purified], 
+                labels=['Adversarial', 'Purified'],
+                patch_artist=True,
+                boxprops=dict(facecolor='lightblue', alpha=0.7),
+                medianprops=dict(color='red', linewidth=2))
+axes[0].set_title('L2 Norm Comparison', fontsize=12, fontweight='bold')
+axes[0].set_ylabel('L2 Norm')
+axes[0].grid(True, alpha=0.3, axis='y')
+
+# L∞ ノルムの比較
+axes[1].boxplot([linf_norms_adv, linf_norms_purified], 
+                labels=['Adversarial', 'Purified'],
+                patch_artist=True,
+                boxprops=dict(facecolor='lightgreen', alpha=0.7),
+                medianprops=dict(color='red', linewidth=2))
+axes[1].set_title('L∞ Norm Comparison', fontsize=12, fontweight='bold')
+axes[1].set_ylabel('L∞ Norm')
+axes[1].grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.savefig(os.path.join(save_examples_dir, 'norm_boxplots.png'), dpi=150, bbox_inches='tight')
+plt.show()
+
+# ---------- 精度とノルムの散布図 ----------
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+# 攻撃成功/失敗とL2ノルムの関係
+attack_success = (np.array(all_preds_adv) != np.array(all_labels))
+axes[0].scatter(l2_norms_adv[~attack_success], np.zeros(sum(~attack_success)), 
+                c='green', marker='o', alpha=0.5, label='Attack Failed')
+axes[0].scatter(l2_norms_adv[attack_success], np.ones(sum(attack_success)), 
+                c='red', marker='x', alpha=0.5, label='Attack Succeeded')
+axes[0].set_xlabel('L2 Norm')
+axes[0].set_yticks([0, 1])
+axes[0].set_yticklabels(['Attack Failed', 'Attack Succeeded'])
+axes[0].set_title('Attack Success vs L2 Norm', fontsize=12, fontweight='bold')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+# 浄化成功/失敗とL2ノルムの関係
+purify_success = (np.array(all_preds_purified) == np.array(all_labels))
+axes[1].scatter(l2_norms_purified[~purify_success], np.zeros(sum(~purify_success)), 
+                c='red', marker='x', alpha=0.5, label='Purify Failed')
+axes[1].scatter(l2_norms_purified[purify_success], np.ones(sum(purify_success)), 
+                c='green', marker='o', alpha=0.5, label='Purify Succeeded')
+axes[1].set_xlabel('L2 Norm (Purified vs Clean)')
+axes[1].set_yticks([0, 1])
+axes[1].set_yticklabels(['Purify Failed', 'Purify Succeeded'])
+axes[1].set_title('Purification Success vs L2 Norm', fontsize=12, fontweight='bold')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(os.path.join(save_examples_dir, 'success_vs_norms.png'), dpi=150, bbox_inches='tight')
+plt.show()
+
+print(f"\n✅ Norm distribution plots saved to: {save_examples_dir}")
+print("   - norm_distributions.png: L2/L∞ヒストグラム")
+print("   - norm_boxplots.png: ボックスプロット比較")
+print("   - success_vs_norms.png: 成功率とノルムの関係")
+
+# ---------- 詳細統計をCSVに保存 ----------
+stats_df = pd.DataFrame({
+    'true_label': all_labels,
+    'pred_clean': all_preds_clean,
+    'pred_adv': all_preds_adv,
+    'pred_purified': all_preds_purified,
+    'l2_norm_adv': l2_norms_adv,
+    'linf_norm_adv': linf_norms_adv,
+    'l2_norm_purified': l2_norms_purified,
+    'linf_norm_purified': linf_norms_purified,
+})
+
+# 攻撃成功/失敗フラグ
+stats_df['attack_success'] = (stats_df['pred_adv'] != stats_df['true_label']).astype(int)
+stats_df['purify_success'] = (stats_df['pred_purified'] == stats_df['true_label']).astype(int)
+stats_df['defense_recovery'] = ((stats_df['attack_success'] == 1) & (stats_df['purify_success'] == 1)).astype(int)
+
+csv_path = os.path.join(save_examples_dir, 'detailed_results.csv')
+stats_df.to_csv(csv_path, index=False)
+print(f"\n✅ Detailed statistics saved to: {csv_path}")
+
+# サマリー統計をテキストファイルに保存
+summary_path = os.path.join(save_examples_dir, 'summary_statistics.txt')
+with open(summary_path, 'w') as f:
+    f.write("="*70 + "\n")
+    f.write("FGSM Attack + DDPM Purification - Summary Statistics\n")
+    f.write("="*70 + "\n\n")
+    f.write(f"Attack Parameters:\n")
+    f.write(f"  Method: FGSM (Fast Gradient Sign Method)\n")
+    f.write(f"  Epsilon: {epsilon_pixel:.4f} ({epsilon_pixel*255:.1f}/255)\n\n")
+    f.write(f"Purification Parameters:\n")
+    f.write(f"  Method: DDPM (Denoising Diffusion Probabilistic Model)\n")
+    f.write(f"  Start timestep (t): {start_t}\n")
+    f.write(f"  Purification steps: {T_purify}\n")
+    f.write(f"  Checkpoint: {ddpm_ckpt}\n\n")
+    f.write("-"*70 + "\n")
+    f.write(f"Results (evaluated on {total} correctly classified images):\n")
+    f.write("-"*70 + "\n")
+    f.write(f"Clean Accuracy:      {clean_acc:.4f} ({correct_clean}/{total})\n")
+    f.write(f"Adversarial Accuracy:{adv_acc:.4f} ({correct_adv}/{total})\n")
+    f.write(f"Purified Accuracy:   {pur_acc:.4f} ({correct_purified}/{total})\n")
+    f.write(f"Defense Improvement: {pur_acc - adv_acc:+.4f}\n")
+    f.write(f"Attack Success Rate: {1 - adv_acc:.4f}\n")
+    f.write(f"Defense Success Rate:{(correct_purified - correct_adv) / (total - correct_adv) if (total - correct_adv) > 0 else 0:.4f} (on attacked samples)\n\n")
+    f.write("="*70 + "\n")
+    f.write("Perturbation Norms:\n")
+    f.write("="*70 + "\n")
+    f.write("Adversarial Perturbations (vs Clean):\n")
+    f.write(f"  L2 norm:   mean={l2_norms_adv.mean():.6f}, std={l2_norms_adv.std():.6f}\n")
+    f.write(f"             min={l2_norms_adv.min():.6f}, max={l2_norms_adv.max():.6f}\n")
+    f.write(f"             median={np.median(l2_norms_adv):.6f}\n")
+    f.write(f"  L∞ norm:   mean={linf_norms_adv.mean():.6f}, std={linf_norms_adv.std():.6f}\n")
+    f.write(f"             min={linf_norms_adv.min():.6f}, max={linf_norms_adv.max():.6f}\n")
+    f.write(f"             median={np.median(linf_norms_adv):.6f}\n\n")
+    f.write("Purified Images (vs Clean):\n")
+    f.write(f"  L2 norm:   mean={l2_norms_purified.mean():.6f}, std={l2_norms_purified.std():.6f}\n")
+    f.write(f"             min={l2_norms_purified.min():.6f}, max={l2_norms_purified.max():.6f}\n")
+    f.write(f"             median={np.median(l2_norms_purified):.6f}\n")
+    f.write(f"  L∞ norm:   mean={linf_norms_purified.mean():.6f}, std={linf_norms_purified.std():.6f}\n")
+    f.write(f"             min={linf_norms_purified.min():.6f}, max={linf_norms_purified.max():.6f}\n")
+    f.write(f"             median={np.median(linf_norms_purified):.6f}\n\n")
+    f.write("="*70 + "\n")
+    f.write("Confusion Matrix Statistics:\n")
+    f.write("="*70 + "\n")
+    for name, preds in [("Clean", all_preds_clean), ("Adversarial", all_preds_adv), ("Purified", all_preds_purified)]:
+        cm = confusion_matrix(all_labels, preds)
+        tn, fp, fn, tp = cm.ravel()
+        precision = tp/(tp+fp) if (tp+fp)>0 else 0.0
+        recall = tp/(tp+fn) if (tp+fn)>0 else 0.0
+        f1 = (2*precision*recall)/(precision+recall) if (precision+recall)>0 else 0.0
+        specificity = tn/(tn+fp) if (tn+fp)>0 else 0.0
+        f.write(f"\n{name} Images:\n")
+        f.write(f"  TN: {tn:4d}  FP: {fp:4d}  FN: {fn:4d}  TP: {tp:4d}\n")
+        f.write(f"  Precision:   {precision:.4f}\n")
+        f.write(f"  Recall:      {recall:.4f}\n")
+        f.write(f"  F1-Score:    {f1:.4f}\n")
+        f.write(f"  Specificity: {specificity:.4f}\n")
+
+print(f"✅ Summary statistics saved to: {summary_path}")
+
+print("\n" + "="*70)
+print("All evaluations completed successfully!")
+print("="*70)
