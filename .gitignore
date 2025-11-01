@@ -60,6 +60,7 @@ imagenet-256/
 *.csv
 *.txt
 *.png
+*.tif
 
 # Jupyterのチェックポイント
 .ipynb_checkpoints/
