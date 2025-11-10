@@ -399,7 +399,7 @@ print("="*70)
 
 # 実験パラメータ
 epsilon_pixel = 8/255.0
-start_t = 100
+start_t = 80
 T_purify = 50
 save_examples_dir = "/mnt/data1/gotou/kaggle/dermmel/fgsm/purify_examples"
 os.makedirs(save_examples_dir, exist_ok=True)
