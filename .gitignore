@@ -45,3 +45,8 @@ __pycache__/
 /mnt/data1/gotou/projects/Medical/diffusion/data/
 dp/data/
 
+*.png
+*.jpg
+*.jpeg
+*.txt
+
