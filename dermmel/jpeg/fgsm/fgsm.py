@@ -237,7 +237,7 @@ print("="*70)
 
 # 実験パラメータ
 epsilon_pixel = 8/255.0
-jpeg_qualities = [10,20,30,40,50,60,70,80,90]  # 複数のJPEG品質でテスト
+jpeg_qualities = [11]  # 複数のJPEG品質でテスト
 save_examples_dir = "/mnt/data1/gotou/projects/dermmel/jpeg/fgsm/defense_results"
 os.makedirs(save_examples_dir, exist_ok=True)
 

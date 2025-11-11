@@ -13,7 +13,7 @@ from PIL import Image
 import numpy as np
 from tqdm.auto import tqdm  # これを追加
 
-DATA_DIR = '/mnt/data1/gotou/kaggle/pcam'
+DATA_DIR = '/mnt/data1/gotou/projects/data'
 TRAIN_IMG_DIR = os.path.join(DATA_DIR, 'train')
 LABELS_CSV = os.path.join(DATA_DIR, 'train_labels.csv')
 TEST_IMG_DIR = os.path.join(DATA_DIR, 'test')
@@ -90,7 +90,7 @@ model.fc = nn.Linear(model.fc.in_features, 1)  # 1ユニット出力
 model = model.to(device)
 
 # 重みロード
-ckpt_path = "/mnt/data1/gotou/kaggle/pcam/best_model_weights.pth"
+ckpt_path = "/mnt/data1/gotou/projects/data/best_model_weights.pth"
 state_dict = torch.load(ckpt_path, map_location=device)
 model.load_state_dict(state_dict)
 model.eval()
@@ -207,20 +207,6 @@ def autoattack_attack(model, images, labels, epsilon_pixel, device,
     return adv_images_norm
 
 
-
-
-
-# In[5]:
-
-
-# evaluate_clean_and_fgsm(model, val_loader, device, epsilon_pixel=30/255, mean=mean, std=std)
-# original_acc, adversarial_acc = evaluate_clean_and_fgsm(model, val_loader, device, epsilon_pixel=0.01, mean=mean, std=std)
-
-
-# In[ ]:
-
-
-# ddpm_purify_eval_pipeline.py
 import os
 import torch
 import torch.nn.functional as F
