@@ -48,7 +48,7 @@
 ## 📁 プロジェクト構成
 
 ```
-kaggle/
+projects/
 ├── README                          # このファイル
 ├── chestxray/                      # 胸部X線画像（肺炎分類）
 │   ├── ddpm_train.py              # 拡散モデル訓練

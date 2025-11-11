@@ -222,8 +222,8 @@ import numpy as np
 # ---------- Basic device / paths ----------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 学習済みDDPM（ddpm.pyで学習したチェックポイント）
-ddpm_ckpt = "/mnt/data1/gotou/kaggle/path/ddpm_out/ddpm2_epoch10.pth"
-clf_ckpt  = "/mnt/data1/gotou/kaggle/pcam/best_model_weights.pth"
+ddpm_ckpt = "/mnt/data1/gotou/projects/path/ddpm_out/ddpm1_epoch10.pth"
+clf_ckpt  = "/mnt/data1/gotou/projects/data/best_model_weights.pth"
 
 # --- モデル定義（ddpm.pyと一致） ---
 class SinusoidalPosEmb(nn.Module):
@@ -442,15 +442,11 @@ print("Loaded classifier and ddpm (ddpm_out epoch10).")
 epsilon_pixel = 8/255.0
 start_t = 80    # 浄化開始時刻
 T_purify = 50    # 逆拡散反復数（短縮して高速化）
-save_examples_dir = "purify_examples2"  # 出力ディレクトリ
+save_examples_dir = "purify_examples"  # 出力ディレクトリ
 os.makedirs(save_examples_dir, exist_ok=True)
-# per-image 出力用ディレクトリ
+# triplets のみ出力
 save_triplets_dir = os.path.join(save_examples_dir, "triplets")
-save_clean_dir    = os.path.join(save_examples_dir, "clean")
-save_adv_dir      = os.path.join(save_examples_dir, "adversarial")
-save_pur_dir      = os.path.join(save_examples_dir, "purified")
-for d in [save_triplets_dir, save_clean_dir, save_adv_dir, save_pur_dir]:
-    os.makedirs(d, exist_ok=True)
+os.makedirs(save_triplets_dir, exist_ok=True)
 
 # Use smaller loader if defined
 # 全検証画像を使用
@@ -458,7 +454,7 @@ EVAL_LOADER = val_loader
 print(f"Using all {len(val_dataset)} validation images for evaluation.")
 
 # 画像保存の設定
-MAX_IMAGES_TO_SAVE = 20  # 最初の何枚を保存するか
+MAX_IMAGES_TO_SAVE = 3  # 3枚のみ保存
 saved_image_count = 0
 
 # グローバルindex
@@ -564,7 +560,7 @@ for batch_idx, (images_norm, labels) in enumerate(tqdm(EVAL_LOADER, desc="Eval l
         l2_norms_purified.extend(l2_pur)
         linf_norms_purified.extend(linf_pur)
 
-    # 5) save per-image outputs (original/adv/purified) and triplet tiles - 最初の何枚かのみ
+    # 5) save triplet images only - 最初の3枚のみ
     if saved_image_count < MAX_IMAGES_TO_SAVE:
         clean_pixel = unnormalize(images_norm_correct.detach()).clamp(0,1)
         adv_pixel   = unnormalize(adv_images_norm.detach()).clamp(0,1)
@@ -588,11 +584,7 @@ for batch_idx, (images_norm, labels) in enumerate(tqdm(EVAL_LOADER, desc="Eval l
                 img_id = f"idx{saved_image_count:05d}"
             label_int = int(labels_correct[i].item())
             
-            # individual saves
-            save_image(clean_resized[i], os.path.join(save_clean_dir, f"{saved_image_count:05d}_{img_id}_label{label_int}_clean.png"))
-            save_image(adv_resized[i],   os.path.join(save_adv_dir,   f"{saved_image_count:05d}_{img_id}_label{label_int}_adv.png"))
-            save_image(pur_resized[i],   os.path.join(save_pur_dir,   f"{saved_image_count:05d}_{img_id}_label{label_int}_purified.png"))
-            # triplet tile
+            # triplet tile のみ保存
             row = torch.cat([clean_resized[i], adv_resized[i], pur_resized[i]], dim=2)
             save_image(row, os.path.join(save_triplets_dir, f"{saved_image_count:05d}_{img_id}_triplet.png"))
             saved_image_count += 1
@@ -638,25 +630,18 @@ print(f"  L∞ norm:   mean={linf_norms_purified.mean():.4f}, std={linf_norms_pu
       f"min={linf_norms_purified.min():.4f}, max={linf_norms_purified.max():.4f}")
 print("="*70)
 
-print(f"\nSaved {saved_image_count} example images to: {save_examples_dir}")
-print(f"- Individual images: {save_clean_dir}, {save_adv_dir}, {save_pur_dir}")
-print(f"- Triplets per image: {save_triplets_dir}")
+print(f"\nSaved {saved_image_count} triplet images to: {save_triplets_dir}")
 
-# ---------- 混同行列の計算と可視化 ----------
-def plot_confusion_matrix(y_true, y_pred, title, filename):
+# ---------- 混同行列の計算（テキスト形式のみ） ----------
+def print_confusion_matrix(y_true, y_pred, title):
     cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=['Normal', 'Tumor'],
-                yticklabels=['Normal', 'Tumor'])
-    plt.title(title, fontsize=14, fontweight='bold')
-    plt.ylabel('True Label', fontsize=12)
-    plt.xlabel('Predicted Label', fontsize=12)
-    plt.tight_layout()
-    plt.savefig(filename, dpi=150, bbox_inches='tight')
-    plt.show()
     tn, fp, fn, tp = cm.ravel()
     print(f"\n{title}:")
+    print(f"  Confusion Matrix:")
+    print(f"                Predicted")
+    print(f"                Normal  Tumor")
+    print(f"  Actual Normal   {tn:5d}  {fp:5d}")
+    print(f"         Tumor    {fn:5d}  {tp:5d}")
     print(f"  True Negatives:  {tn}")
     print(f"  False Positives: {fp}")
     print(f"  False Negatives: {fn}")
@@ -668,160 +653,17 @@ def plot_confusion_matrix(y_true, y_pred, title, filename):
     print(f"  Recall:    {recall:.4f}")
     print(f"  F1-Score:  {f1:.4f}")
 
-print("\n" + "="*50)
-print("Confusion Matrix Analysis")
-print("="*50)
-
-plot_confusion_matrix(
-    all_labels, all_preds_clean,
-    "Confusion Matrix - Clean Images",
-    os.path.join(save_examples_dir, "confusion_matrix_clean.png")
-)
-
-plot_confusion_matrix(
-    all_labels, all_preds_adv,
-    "Confusion Matrix - Adversarial (AutoAttack)",
-    os.path.join(save_examples_dir, "confusion_matrix_adversarial.png")
-)
-
-plot_confusion_matrix(
-    all_labels, all_preds_purified,
-    "Confusion Matrix - Purified Images",
-    os.path.join(save_examples_dir, "confusion_matrix_purified.png")
-)
-
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-cm_clean = confusion_matrix(all_labels, all_preds_clean)
-cm_adv = confusion_matrix(all_labels, all_preds_adv)
-cm_pur = confusion_matrix(all_labels, all_preds_purified)
-titles = ['Clean Images', 'Adversarial (AutoAttack)', 'Purified Images']
-cms = [cm_clean, cm_adv, cm_pur]
-accs = [clean_acc, adv_acc, pur_acc]
-for ax, cm, title, acc in zip(axes, cms, titles, accs):
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
-                xticklabels=['Normal', 'Tumor'],
-                yticklabels=['Normal', 'Tumor'])
-    ax.set_title(f'{title}\nAccuracy: {acc:.4f}', fontsize=12, fontweight='bold')
-    ax.set_ylabel('True Label')
-    ax.set_xlabel('Predicted Label')
-plt.tight_layout()
-plt.savefig(os.path.join(save_examples_dir, 'confusion_matrix_comparison.png'), 
-            dpi=150, bbox_inches='tight')
-plt.show()
-print(f"\n✅ All confusion matrices saved to: {save_examples_dir}")
-
-# ---------- ノルム分布の可視化 ----------
 print("\n" + "="*70)
-print("Generating norm distribution plots...")
+print("Confusion Matrix Analysis")
 print("="*70)
 
-# L2ノルムのヒストグラム
-fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+print_confusion_matrix(all_labels, all_preds_clean, "Clean Images")
+print_confusion_matrix(all_labels, all_preds_adv, "Adversarial (AutoAttack)")
+print_confusion_matrix(all_labels, all_preds_purified, "Purified Images")
 
-# L2 ノルム - Adversarial
-axes[0, 0].hist(l2_norms_adv, bins=50, color='red', alpha=0.7, edgecolor='black')
-axes[0, 0].axvline(l2_norms_adv.mean(), color='darkred', linestyle='--', linewidth=2, label=f'Mean: {l2_norms_adv.mean():.4f}')
-axes[0, 0].set_title('L2 Norm Distribution - Adversarial Perturbations (AutoAttack)', fontsize=12, fontweight='bold')
-axes[0, 0].set_xlabel('L2 Norm')
-axes[0, 0].set_ylabel('Frequency')
-axes[0, 0].legend()
-axes[0, 0].grid(True, alpha=0.3)
+print("="*70)
 
-# L∞ ノルム - Adversarial
-axes[0, 1].hist(linf_norms_adv, bins=50, color='orange', alpha=0.7, edgecolor='black')
-axes[0, 1].axvline(linf_norms_adv.mean(), color='darkorange', linestyle='--', linewidth=2, label=f'Mean: {linf_norms_adv.mean():.4f}')
-axes[0, 1].set_title('L∞ Norm Distribution - Adversarial Perturbations (AutoAttack)', fontsize=12, fontweight='bold')
-axes[0, 1].set_xlabel('L∞ Norm')
-axes[0, 1].set_ylabel('Frequency')
-axes[0, 1].legend()
-axes[0, 1].grid(True, alpha=0.3)
-
-# L2 ノルム - Purified
-axes[1, 0].hist(l2_norms_purified, bins=50, color='blue', alpha=0.7, edgecolor='black')
-axes[1, 0].axvline(l2_norms_purified.mean(), color='darkblue', linestyle='--', linewidth=2, label=f'Mean: {l2_norms_purified.mean():.4f}')
-axes[1, 0].set_title('L2 Norm Distribution - Purified vs Clean', fontsize=12, fontweight='bold')
-axes[1, 0].set_xlabel('L2 Norm')
-axes[1, 0].set_ylabel('Frequency')
-axes[1, 0].legend()
-axes[1, 0].grid(True, alpha=0.3)
-
-# L∞ ノルム - Purified
-axes[1, 1].hist(linf_norms_purified, bins=50, color='green', alpha=0.7, edgecolor='black')
-axes[1, 1].axvline(linf_norms_purified.mean(), color='darkgreen', linestyle='--', linewidth=2, label=f'Mean: {linf_norms_purified.mean():.4f}')
-axes[1, 1].set_title('L∞ Norm Distribution - Purified vs Clean', fontsize=12, fontweight='bold')
-axes[1, 1].set_xlabel('L∞ Norm')
-axes[1, 1].set_ylabel('Frequency')
-axes[1, 1].legend()
-axes[1, 1].grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.savefig(os.path.join(save_examples_dir, 'norm_distributions.png'), dpi=150, bbox_inches='tight')
-plt.show()
-
-# ボックスプロット比較
-fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-# L2 ノルムの比較
-axes[0].boxplot([l2_norms_adv, l2_norms_purified], 
-                labels=['Adversarial', 'Purified'],
-                patch_artist=True,
-                boxprops=dict(facecolor='lightblue', alpha=0.7),
-                medianprops=dict(color='red', linewidth=2))
-axes[0].set_title('L2 Norm Comparison', fontsize=12, fontweight='bold')
-axes[0].set_ylabel('L2 Norm')
-axes[0].grid(True, alpha=0.3, axis='y')
-
-# L∞ ノルムの比較
-axes[1].boxplot([linf_norms_adv, linf_norms_purified], 
-                labels=['Adversarial', 'Purified'],
-                patch_artist=True,
-                boxprops=dict(facecolor='lightgreen', alpha=0.7),
-                medianprops=dict(color='red', linewidth=2))
-axes[1].set_title('L∞ Norm Comparison', fontsize=12, fontweight='bold')
-axes[1].set_ylabel('L∞ Norm')
-axes[1].grid(True, alpha=0.3, axis='y')
-
-plt.tight_layout()
-plt.savefig(os.path.join(save_examples_dir, 'norm_boxplots.png'), dpi=150, bbox_inches='tight')
-plt.show()
-
-# ---------- 精度とノルムの散布図 ----------
-fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-# 攻撃成功/失敗とL2ノルムの関係
-attack_success = (np.array(all_preds_adv) != np.array(all_labels))
-axes[0].scatter(l2_norms_adv[~attack_success], np.zeros(sum(~attack_success)), 
-                c='green', marker='o', alpha=0.5, label='Attack Failed')
-axes[0].scatter(l2_norms_adv[attack_success], np.ones(sum(attack_success)), 
-                c='red', marker='x', alpha=0.5, label='Attack Succeeded')
-axes[0].set_xlabel('L2 Norm')
-axes[0].set_yticks([0, 1])
-axes[0].set_yticklabels(['Attack Failed', 'Attack Succeeded'])
-axes[0].set_title('Attack Success vs L2 Norm', fontsize=12, fontweight='bold')
-axes[0].legend()
-axes[0].grid(True, alpha=0.3)
-
-# 浄化成功/失敗とL2ノルムの関係
-purify_success = (np.array(all_preds_purified) == np.array(all_labels))
-axes[1].scatter(l2_norms_purified[~purify_success], np.zeros(sum(~purify_success)), 
-                c='red', marker='x', alpha=0.5, label='Purify Failed')
-axes[1].scatter(l2_norms_purified[purify_success], np.ones(sum(purify_success)), 
-                c='green', marker='o', alpha=0.5, label='Purify Succeeded')
-axes[1].set_xlabel('L2 Norm (Purified vs Clean)')
-axes[1].set_yticks([0, 1])
-axes[1].set_yticklabels(['Purify Failed', 'Purify Succeeded'])
-axes[1].set_title('Purification Success vs L2 Norm', fontsize=12, fontweight='bold')
-axes[1].legend()
-axes[1].grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.savefig(os.path.join(save_examples_dir, 'success_vs_norms.png'), dpi=150, bbox_inches='tight')
-plt.show()
-
-print(f"\n✅ Norm distribution plots saved to: {save_examples_dir}")
-print("   - norm_distributions.png: L2/L∞ヒストグラム")
-print("   - norm_boxplots.png: ボックスプロット比較")
-print("   - success_vs_norms.png: 成功率とノルムの関係")
+# ---------- ノルム分布のテキストサマリーのみ ----------
 
 # ---------- 詳細統計をCSVに保存 ----------
 stats_df = pd.DataFrame({
