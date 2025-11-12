@@ -22,7 +22,7 @@ DATA_DIR = '/mnt/data1/Public/MedImages/CellData/chest_xray'
 TRAIN_DIR = os.path.join(DATA_DIR, 'train')
 TEST_DIR = os.path.join(DATA_DIR, 'test')
 
-device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Device: {device}")
 
 # ========== データセット定義 ==========
