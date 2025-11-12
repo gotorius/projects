@@ -29,7 +29,7 @@ TRAIN_IMG_DIR = os.path.join(DATA_DIR, 'train')
 LABELS_CSV = os.path.join(DATA_DIR, 'train_labels.csv')
 TEST_IMG_DIR = os.path.join(DATA_DIR, 'test')
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Device: {device}")
 
 # ========== データ変換 ==========
