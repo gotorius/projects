@@ -1,4 +1,4 @@
-※README.mdはclaudeで作成
+※README.mdはClaude Sonnet4.5で作成
 
 # 拡散モデルを用いた敵対的攻撃に対する防御手法の研究
 
