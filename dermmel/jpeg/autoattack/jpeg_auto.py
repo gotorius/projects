@@ -138,7 +138,7 @@ def jpeg_compress_batch(x_pix, quality=75):
 
 # ========== 評価設定 ==========
 EPSILON_PIXEL = 8 / 255.0
-JPEG_QUALITY = 75
+JPEG_QUALITY = 11
 
 out_dir = f'/mnt/data1/gotou/projects/dermmel/jpeg/autoattack/results_q{JPEG_QUALITY}_autoattack'
 os.makedirs(out_dir, exist_ok=True)

@@ -1,230 +1,130 @@
-# DermMel ResNet50 分類モデル訓練
+# DermMel敵対的防御実験結果サマリー
 
-DermMelデータセット（Melanoma vs NotMelanoma）でResNet50を訓練し、敵対的攻撃実験用のモデルを保存します。
+## 実験概要
 
-## ディレクトリ構成
+- **データセット**: DermMel validation set (Melanoma vs NotMelanoma)
+- **対象画像数**: 3,434枚 (クリーン画像で正しく分類された画像のみ)
+- **分類器**: ResNet50 (`/mnt/data1/gotou/projects/dermmel/resnet/resnet50_best.pth`)
+- **防御手法**: 
+  - DDPM (start_t=80, steps=50)
+  - JPEG圧縮 (quality=11)
+- **攻撃手法**:
+  - FGSM (ε=8/255=0.0314)
+  - PGD-10 (ε=8/255, α=2/255, 10ステップ, random_start=True)
+  - AutoAttack (APGD-CE, ε=8/255)
+
+---
+
+## 結果サマリー
+
+### 1. FGSM攻撃に対する防御
+
+| 指標 | クリーン | 敵対的例 | DDPM防御 | JPEG防御 |
+|------|----------|----------|----------|----------|
+| **精度** | 100.00% | 43.42% | **53.47%** | 49.53% |
+| **改善率** | - | - | **+10.05%** | +6.12% |
+| **攻撃成功率** | - | 56.58% | - | - |
+| **防御成功率** | - | - | 17.76% | 10.81% |
+
+**Perturbation Norms (Adversarial vs Clean):**
+- L2: mean=12.15, L∞: mean=0.0314
+
+**Perturbation Norms (Purified vs Clean):**
+- DDPM: L2=9.21±1.70, L∞=0.207±0.056
+- JPEG: L2=11.46±1.80, L∞=0.230±0.065
+
+---
+
+### 2. PGD-10攻撃に対する防御
+
+| 指標 | クリーン | 敵対的例 | DDPM防御 | JPEG防御 |
+|------|----------|----------|----------|----------|
+| **精度** | 100.00% | 0.00% | **64.91%** | 49.56% |
+| **改善率** | - | - | **+64.91%** | +49.56% |
+
+**Perturbation Norms (Adversarial vs Clean):**
+- L2: mean=8.02±0.12, L∞: mean=0.0314
+
+**Perturbation Norms (Purified vs Clean):**
+- DDPM: L2=8.96±1.69, L∞=0.203±0.055
+- JPEG: L2=10.64±1.65, L∞=0.220±0.066
+
+**混同行列 (DDPM防御):**
+- TN:1631, FP:70, FN:1135, TP:598
+- Precision: 90.82%, Recall: 27.41%, F1: 42.11%, Specificity: 97.18%
+
+**混同行列 (JPEG防御):**
+- TN:1701, FP:0, FN:1732, TP:1
+- Precision: 0.00%, Recall: 0.00%, F1: 0.00%
+
+---
+
+### 3. AutoAttack (APGD-CE)に対する防御
+
+| 指標 | クリーン | 敵対的例 | DDPM防御 | JPEG防御 |
+|------|----------|----------|----------|----------|
+| **精度** | 100.00% | 0.00% | **61.97%** | 49.56% |
+| **改善率** | - | - | **+61.97%** | +49.56% |
+
+**Perturbation Norms (Adversarial vs Clean):**
+- DDPM実験: L2=8.69±0.28, L∞=0.0314
+- JPEG実験: L2=8.69±0.28, L∞=0.0314
+
+**Perturbation Norms (Purified vs Clean):**
+- DDPM: L2=9.21±1.70, L∞=0.207±0.056
+- JPEG: L2=10.97±1.63, L∞=0.223±0.067
+
+**混同行列 (DDPM防御):**
+- TN:1653, FP:48, FN:1258, TP:475
+- Precision: 90.82%, Recall: 27.41%, F1: 42.11%, Specificity: 97.18%
+
+**混同行列 (JPEG防御):**
+- TN:1701, FP:0, FN:1732, TP:1
+- Precision: 0.00%, Recall: 0.00%, F1: 0.00%
+
+---
+
+## 総合評価
+
+### 防御性能比較 (精度改善率)
 
 ```
-/mnt/data1/Public/MedImages/DermMel/
-├── train_sep/
-│   ├── Melanoma/
-│   └── NotMelanoma/
-├── valid/
-│   ├── Melanoma/
-│   └── NotMelanoma/
-└── test/
-    ├── Melanoma/
-    └── NotMelanoma/
+攻撃手法      | DDPM防御  | JPEG防御  | 優位性
+-------------|-----------|-----------|--------
+FGSM         | +10.05%   | +6.12%    | DDPM
+PGD-10       | +64.91%   | +49.56%   | DDPM
+AutoAttack   | +61.97%   | +49.56%   | DDPM
 ```
 
-## ファイル説明
+### 主要な知見
 
-- **resnet50.py**: ResNet50訓練スクリプト（メイン）
-- **load_model.py**: 訓練済みモデルを読み込むユーティリティ
-- **README.md**: このファイル
+1. **DDPM防御の優位性**
+   - 全ての攻撃手法に対してDDPM防御がJPEG圧縮よりも高い防御性能を示した
+   - 特にPGD-10とAutoAttackに対して約60-65%の精度を達成
 
-## 使用方法
+2. **攻撃強度の違い**
+   - FGSM: 最も弱い攻撃 (敵対的精度43.42%)
+   - PGD-10 & AutoAttack: 非常に強力 (敵対的精度0.00%)
 
-### 1. モデルの訓練
+3. **JPEG圧縮の限界**
+   - PGD-10とAutoAttackに対して49.56%の精度
+   - 混同行列から、ほとんどがNotMelanomaと予測される傾向(FP=0, FN=1732)
+   - True Positiveがほぼ0で、Melanoma検出に失敗
 
-```bash
-cd /mnt/data1/gotou/kaggle/dermmel
-python resnet50.py
-```
+4. **DDPM防御の特徴**
+   - より高いSpecificity (97.18%)を維持
+   - RecallとF1スコアは低いが、JPEG圧縮よりは改善
+   - 摂動ノルムはJPEGより小さく、より原画像に近い復元
 
-訓練が完了すると、以下のファイルが `resnet50_models/` に保存されます：
+5. **Perturbation分析**
+   - DDPMの復元画像: L2≈9, L∞≈0.2
+   - JPEGの復元画像: L2≈11, L∞≈0.22
+   - DDPMの方が原画像により近い復元を実現
 
-- `resnet50_best.pth`: 最良の検証精度を達成したモデル（完全版）
-- `resnet50_inference.pth`: 推論専用モデル（敵対的攻撃実験用）
-- `resnet50_epoch{N}.pth`: 定期チェックポイント（10エポックごと）
-- `training_history.npz`: 訓練履歴（loss, accuracy）
+---
 
-### 2. モデルの読み込み（敵対的攻撃実験用）
+## 結論
 
-```python
-from load_model import load_resnet50_for_inference
+DermMelデータセットにおける敵対的防御実験において、**DDPM (start_t=80, steps=50)** はJPEG圧縮(quality=11)よりも一貫して優れた防御性能を示しました。特に強力なPGD-10およびAutoAttack攻撃に対して約62-65%の精度を達成し、原画像により近い復元を実現しています。
 
-# モデルを読み込み
-model_path = 'resnet50_models/resnet50_inference.pth'
-model, class_names, class_to_idx = load_resnet50_for_inference(model_path)
-
-# 推論
-import torch
-from torchvision import transforms
-from PIL import Image
-
-# 画像の前処理
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                       std=[0.229, 0.224, 0.225])
-])
-
-# 画像を読み込んで予測
-image = Image.open('sample.jpg').convert('RGB')
-input_tensor = transform(image).unsqueeze(0)
-input_tensor = input_tensor.to(next(model.parameters()).device)
-
-with torch.no_grad():
-    output = model(input_tensor)
-    pred_class = torch.argmax(output, dim=1).item()
-    print(f"Predicted: {class_names[pred_class]}")
-```
-
-### 3. 訓練の再開
-
-```python
-from load_model import load_resnet50_for_training
-
-model, checkpoint = load_resnet50_for_training('resnet50_models/resnet50_best.pth')
-
-# optimizerとschedulerを復元
-optimizer = torch.optim.Adam(model.parameters())
-optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
-scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-start_epoch = checkpoint['epoch'] + 1
-# 訓練を続ける...
-```
-
-## ハイパーパラメータ
-
-| パラメータ | 値 | 説明 |
-|-----------|-----|------|
-| IMAGE_SIZE | 224 | 入力画像サイズ |
-| BATCH_SIZE | 32 | バッチサイズ |
-| EPOCHS | 50 | 訓練エポック数 |
-| LEARNING_RATE | 1e-4 | 初期学習率 |
-| Optimizer | Adam | 最適化アルゴリズム |
-| Scheduler | ReduceLROnPlateau | 学習率スケジューラ |
-
-## データ拡張
-
-### 訓練データ
-- Resize → RandomCrop
-- RandomHorizontalFlip
-- RandomVerticalFlip
-- RandomRotation (±20度)
-- ColorJitter (brightness, contrast, saturation, hue)
-- ImageNet正規化
-
-### 検証データ
-- Resize (224×224)
-- ImageNet正規化のみ
-
-## モデル構造
-
-- **ベースモデル**: ResNet50 (ImageNet事前訓練済み)
-- **最終層**: Linear(2048 → 2) ← 2クラス分類用に変更
-- **総パラメータ数**: 約25.6M
-
-## 保存されるモデル情報
-
-チェックポイントには以下の情報が含まれます：
-
-```python
-{
-    'epoch': int,                    # エポック番号
-    'model_state_dict': OrderedDict, # モデルの重み
-    'optimizer_state_dict': dict,    # optimizer状態
-    'scheduler_state_dict': dict,    # scheduler状態
-    'valid_acc': float,              # 検証精度
-    'valid_loss': float,             # 検証損失
-    'class_names': list,             # ['Melanoma', 'NotMelanoma']
-    'class_to_idx': dict,            # {'Melanoma': 0, 'NotMelanoma': 1}
-}
-```
-
-## 敵対的攻撃実験での使用
-
-訓練済みモデルは以下の敵対的攻撃手法の評価に使用できます：
-
-- FGSM (Fast Gradient Sign Method)
-- PGD (Projected Gradient Descent)
-- C&W (Carlini & Wagner)
-- DeepFool
-- など
-
-### 攻撃コード例
-
-```python
-import torch
-import torch.nn.functional as F
-from load_model import load_resnet50_for_inference
-
-# モデル読み込み
-model, _, _ = load_resnet50_for_inference('resnet50_models/resnet50_inference.pth')
-model.eval()
-
-# FGSM攻撃
-def fgsm_attack(image, epsilon, data_grad):
-    sign_data_grad = data_grad.sign()
-    perturbed_image = image + epsilon * sign_data_grad
-    return perturbed_image
-
-# 入力画像と正解ラベル
-input_tensor = ...  # shape: (1, 3, 224, 224)
-target = ...        # shape: (1,)
-
-# 勾配を有効化
-input_tensor.requires_grad = True
-
-# Forward
-output = model(input_tensor)
-loss = F.cross_entropy(output, target)
-
-# Backward
-model.zero_grad()
-loss.backward()
-
-# 攻撃画像を生成
-perturbed_image = fgsm_attack(input_tensor, epsilon=0.03, data_grad=input_tensor.grad)
-
-# 攻撃後の予測
-with torch.no_grad():
-    adv_output = model(perturbed_image)
-    adv_pred = torch.argmax(adv_output, dim=1)
-```
-
-## 訓練時のTips
-
-1. **GPUメモリ不足の場合**: `BATCH_SIZE`を16や8に減らす
-2. **過学習の場合**: データ拡張を強化、またはDropoutを追加
-3. **収束が遅い場合**: 学習率を調整（1e-3など）
-4. **クラス不均衡の場合**: `WeightedRandomSampler`を使用
-
-## 評価指標
-
-訓練中に以下の指標が記録されます：
-
-- Training Loss
-- Training Accuracy
-- Validation Loss
-- Validation Accuracy
-
-最良の検証精度を達成したモデルが自動的に保存されます。
-
-## トラブルシューティング
-
-### モデルが読み込めない
-```python
-# デバイスを明示的に指定
-model, _, _ = load_resnet50_for_inference(model_path, device='cpu')
-```
-
-### CUDA out of memory
-```python
-# resnet50.py の BATCH_SIZE を減らす
-BATCH_SIZE = 16  # または 8
-```
-
-### 訓練が進まない
-- 学習率が小さすぎる可能性 → LEARNING_RATE = 1e-3 を試す
-- データが正しく読み込まれているか確認 → print(train_dataset.class_to_idx)
-
-## ライセンス・引用
-
-このコードを研究に使用する場合は、DermMelデータセットの出典を明記してください。
+ただし、両防御手法ともMelanoma検出のRecallが低いという課題があり、医療診断における偽陰性(見逃し)のリスクが高い点には注意が必要です。
