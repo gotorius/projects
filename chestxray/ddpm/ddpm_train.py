@@ -385,6 +385,7 @@ def p_sample_loop(model, shape, device):
         img = p_sample(model, img, t)
     return img
 
+
 # === 学習ループ ===
 scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())  # mixed precision (new API)
 
