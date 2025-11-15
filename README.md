@@ -4,7 +4,7 @@
 
 深層学習モデルに対する敵対的攻撃（Adversarial Attacks）は、セキュリティ上の重大な脅威となっています。本研究では、**拡散モデル（Diffusion Models）を用いた新しい防御手法**を提案し、医療画像分類タスクにおいてその有効性を検証します。
 
-## 📋 目次
+## 目次
 
 - [概要](#概要)
 - [研究の動機](#研究の動機)
@@ -19,11 +19,11 @@
 
 ---
 
-## 🎯 概要
+## 概要
 
-本プロジェクトでは、**拡散モデル（DDPM: Denoising Diffusion Probabilistic Models）** を敵対的攻撃に対する防御機構として活用します。拡散モデルは画像のノイズ除去能力に優れており、敵対的摂動を効果的に除去できる可能性があります。
+本プロジェクトでは、**拡散モデル（DDPM: Denoising Diffusion Probabilistic Models）** を敵対的攻撃に対する防御機構として活用します。拡散モデルは画像のノイズ除去能力に優れており、敵対的摂動を効果的に除去できる可能性がある。
 
-### 研究の主要な貢献
+### 研究の主要な内容
 
 1. **拡散モデルによる敵対的防御**: DDPMを用いて攻撃画像を浄化し、元の画像に復元
 2. **医療画像への適用**: 3つの医療画像データセットで防御性能を評価
@@ -32,7 +32,7 @@
 
 ---
 
-## 🔬 研究の動機
+## 研究の動機
 
 ### 敵対的攻撃の脅威
 
@@ -83,7 +83,7 @@ projects/
 
 ---
 
-## 🗂️ データセット
+## データセット
 
 本研究では、3つの異なる医療画像データセットを使用します。
 
@@ -101,7 +101,8 @@ projects/
 | **データ形式** | H5形式 |
 | **特徴** | リンパ節の組織切片画像 |
 
-**出典**: Veeling et al., "Rotation Equivariant CNNs for Digital Pathology", MICCAI 2018
+**出典**: Histopathologic Cancer Detection　
+https://www.kaggle.com/competitions/histopathologic-cancer-detection/data
 
 ### 2. DermMel (Dermatology Melanoma)
 
@@ -117,7 +118,7 @@ projects/
 | **データ形式** | JPEG |
 | **特徴** | 皮膚鏡画像、データ拡張済み |
 
-**出典**: ISIC (International Skin Imaging Collaboration) アーカイブ
+**出典**: 研究室のデータセット
 
 ### 3. ChestXray (Chest X-ray Pneumonia)
 
@@ -133,11 +134,11 @@ projects/
 | **データ形式** | JPEG |
 | **特徴** | 小児胸部X線、クラス不均衡あり |
 
-**出典**: Kermany et al., "Labeled Optical Coherence Tomography (OCT) and Chest X-Ray Images for Classification", Mendeley Data, 2018
+**出典**: 研究室のデータセット
 
 ---
 
-## ⚔️ 敵対的攻撃手法
+## 敵対的攻撃手法
 
 ### 1. FGSM (Fast Gradient Sign Method)
 
@@ -202,7 +203,7 @@ x_adv^(t+1) = Π_ε(x_adv^(t) + α · sign(∇_x L(θ, x_adv^(t), y)))
 
 ---
 
-## 🛡️ 防御手法
+## 防御手法
 
 ### 1. 拡散モデル（DDPM）【提案手法】
 
@@ -348,61 +349,8 @@ KL = D_KL(N(μ,σ²) || N(0,I))
 
 ---
 
-## 💻 実験環境
 
-### ハードウェア
-
-- **GPU**: NVIDIA RTX 3090 / A100 / V100 等
-- **CPU**: Intel Xeon / AMD EPYC
-- **メモリ**: 32GB以上推奨
-- **ストレージ**: SSD 100GB以上
-
-### ソフトウェア
-
-```bash
-# Python環境
-Python 3.8+
-
-# 主要ライブラリ
-torch >= 1.10.0
-torchvision >= 0.11.0
-numpy >= 1.21.0
-Pillow >= 8.3.0
-tqdm >= 4.62.0
-h5py >= 3.6.0        # PCamデータセット用
-matplotlib >= 3.4.0
-scikit-learn >= 0.24.0
-
-# 攻撃ライブラリ
-foolbox >= 3.3.0     # 各種攻撃手法
-autoattack >= 0.1    # AutoAttack実装
-
-# オプション
-tensorboard >= 2.7.0  # 訓練モニタリング
-wandb >= 0.12.0       # 実験管理
-```
-
-### インストール
-
-```bash
-# 仮想環境の作成
-conda create -n adv-defense python=3.8
-conda activate adv-defense
-
-# PyTorchのインストール（CUDA 11.3の例）
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu113
-
-# その他の依存関係
-pip install numpy pillow tqdm h5py matplotlib scikit-learn
-pip install foolbox autoattack
-
-# オプション
-pip install tensorboard wandb
-```
-
----
-
-## 🚀 使用方法
+## 使用方法
 
 ### 1. 分類器の訓練
 
@@ -487,7 +435,7 @@ python visualize_attacks.py --dataset chestxray --attack pgd
 
 ---
 
-## 📊 実験結果
+## 実験結果
 
 ### 評価指標
 
@@ -519,32 +467,7 @@ python visualize_attacks.py --dataset chestxray --attack pgd
 
 ---
 
-## 📈 今後の展開
-
-### 短期目標
-
-- [ ] 全データセットでの分類器訓練完了
-- [ ] 全データセットでの拡散モデル訓練完了
-- [ ] 攻撃スクリプトの実装（FGSM, PGD, AutoAttack）
-- [ ] 防御スクリプトの実装（DDPM, JPEG, GAN, VAE）
-- [ ] 実験結果の収集と分析
-
-### 中期目標
-
-- [ ] 拡散モデルの最適化（高速化、メモリ効率化）
-- [ ] 適応的攻撃への対応
-- [ ] 他の医療画像データセットへの拡張
-- [ ] 論文執筆と投稿
-
-### 長期目標
-
-- [ ] リアルタイム防御システムの構築
-- [ ] 臨床応用への検討
-- [ ] オープンソース化とコミュニティへの貢献
-
----
-
-## 📚 参考文献
+## 参考文献
 
 ### 拡散モデル
 
@@ -569,28 +492,6 @@ python visualize_attacks.py --dataset chestxray --attack pgd
 10. Veeling, B. S., et al. (2018). "Rotation Equivariant CNNs for Digital Pathology". MICCAI.
 11. Kermany, D. S., et al. (2018). "Identifying Medical Diagnoses and Treatable Diseases by Image-Based Deep Learning". Cell.
 12. Finlayson, S. G., et al. (2019). "Adversarial Attacks on Medical Machine Learning". Science.
-
----
-
-## 👥 貢献者
-
-- **研究者**: [あなたの名前]
-- **所属**: [所属機関]
-- **連絡先**: [メールアドレス]
-
----
-
-## 📄 ライセンス
-
-本プロジェクトは研究目的で公開されています。商用利用の際は別途ご相談ください。
-
----
-
-## 🙏 謝辞
-
-- データセット提供者
-- オープンソースコミュニティ
-- 研究室メンバー
 
 ---
 
