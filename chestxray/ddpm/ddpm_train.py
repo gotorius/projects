@@ -19,16 +19,16 @@ from tqdm.auto import tqdm
 DATA_DIR = '/mnt/data1/Public/MedImages/CellData/chest_xray'
 # ChestXray 用: train 配下にクラス別フォルダ (NORMAL/ PNEUMONIA/) がある
 TRAIN_IMG_DIR = os.path.join(DATA_DIR, 'train')
-OUT_DIR = os.path.join('/mnt/data1/gotou/kaggle/chestxray', 'ddpm_out2')
+OUT_DIR = os.path.join('/mnt/data1/gotou/projects/chestxray', 'ddpm_out2')
 os.makedirs(OUT_DIR, exist_ok=True)
 
 IMAGE_SIZE = 224
-BATCH_SIZE = 16         # GPUメモリに応じて調整（224だと8でも重い場合あり）
+BATCH_SIZE = 8          # 10–12GB GPU向けの安全設定
 EPOCHS = 100
 SAVE_EVERY = 10           # epochごとに保存/サンプル
 LEARNING_RATE = 2e-4
 NUM_WORKERS = 4
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 PRINT_EVERY = 50
 
 # DDPMハイパーパラメータ
@@ -37,6 +37,11 @@ BETA_START = 1e-4
 BETA_END = 0.02
 # 線形βでは霧・色かぶりになりやすいため、cosineスケジュールを推奨
 BETA_SCHEDULE = 'cosine'  # 'linear' or 'cosine'
+
+# 学習目的の改良: v-prediction + P2 loss weighting
+V_PREDICTION = True
+P2_GAMMA = 0.5
+P2_K = 1.0
 
 # === データセット（未ラベル画像を再帰的に走査し、画像を [-1,1] に正規化） ===
 class UnlabeledImageDataset(Dataset):
@@ -62,7 +67,8 @@ class UnlabeledImageDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path = self.paths[idx]
-        image = Image.open(img_path).convert('RGB')
+        # 胸部X線は基本グレースケール。RGBで学習すると不要な自由度が生まれブレの原因になる。
+        image = Image.open(img_path).convert('L')
         if self.transform:
             image = self.transform(image)  # returns tensor in [0,1]
         # scale to [-1, 1]
@@ -72,9 +78,12 @@ class UnlabeledImageDataset(Dataset):
 # ChestXray向け前処理: 構造学習のためRandomCrop+軽い拡張
 # データの多様性を確保しつつ、診断上重要な情報は保持
 train_transform = transforms.Compose([
-    transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.8, 1.0)),
-    transforms.RandomVerticalFlip(),
-    transforms.ColorJitter(0.2, 0.2, 0.2),
+    transforms.Grayscale(num_output_channels=1),
+    transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.85, 1.0)),
+    transforms.RandomHorizontalFlip(p=0.5),  # 左右反転はOK、上下反転はNG
+    transforms.RandomRotation(degrees=7, fill=0),
+    transforms.RandomAutocontrast(p=0.2),
+    transforms.RandomAdjustSharpness(sharpness_factor=1.2, p=0.2),
     transforms.ToTensor(),
 ])
 
@@ -166,16 +175,41 @@ class ResidualBlock(nn.Module):
         h = self.act(h)
         return h + self.skip(x)
 
+# === 自己注意（2D） ===
+class SelfAttention2d(nn.Module):
+    def __init__(self, channels, num_heads=4):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
+        self.ln = nn.LayerNorm(channels)
+        self.ff = nn.Sequential(
+            nn.Linear(channels, channels * 4),
+            nn.GELU(),
+            nn.Linear(channels * 4, channels)
+        )
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        b, c, h, w = x.shape
+        x_flat = x.view(b, c, h * w).transpose(1, 2)  # (B, HW, C)
+        attn_out, _ = self.mha(x_flat, x_flat, x_flat)
+        x_flat = x_flat + attn_out
+        x_flat = x_flat + self.ff(self.ln(x_flat))
+        return x_flat.transpose(1, 2).view(b, c, h, w)
+
 # === 簡易 U-Net ===
 class SimpleUNet(nn.Module):
-    def __init__(self, in_ch=3, base_ch=64, time_emb_dim=256):
+    def __init__(self, in_ch=1, base_ch=64, time_emb_dim=256, attn_heads=4, use_checkpoint=True):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim * 2),
             nn.SiLU(),
             nn.Linear(time_emb_dim * 2, time_emb_dim)
         )
+        
+        def attn(ch):
+            return SelfAttention2d(ch, num_heads=attn_heads)
 
         # down
         self.enc1 = ResidualBlock(in_ch, base_ch, time_emb_dim)
@@ -183,13 +217,16 @@ class SimpleUNet(nn.Module):
         self.enc2 = ResidualBlock(base_ch*2, base_ch*2, time_emb_dim)
         self.down2 = nn.Conv2d(base_ch*2, base_ch*4, 4, stride=2, padding=1)  # /4
         self.enc3 = ResidualBlock(base_ch*4, base_ch*4, time_emb_dim)
+        self.attn3 = attn(base_ch*4)
         self.down3 = nn.Conv2d(base_ch*4, base_ch*8, 4, stride=2, padding=1)  # /8
         self.enc4 = ResidualBlock(base_ch*8, base_ch*8, time_emb_dim)
+        self.attn4 = attn(base_ch*8)
         self.down4 = nn.Conv2d(base_ch*8, base_ch*8, 4, stride=2, padding=1)  # /16
 
         # bottleneck
         self.bot1 = ResidualBlock(base_ch*8, base_ch*8, time_emb_dim)
         self.bot2 = ResidualBlock(base_ch*8, base_ch*8, time_emb_dim)
+        self.attn_bot = attn(base_ch*8)
 
         # up
         self.up4 = nn.ConvTranspose2d(base_ch*8, base_ch*8, 4, stride=2, padding=1)
@@ -211,18 +248,29 @@ class SimpleUNet(nn.Module):
         # t: (batch,) long or float
         t_emb = self.time_mlp(t)  # (batch, time_emb_dim)
 
+        def cp(fn, *args):
+            if self.use_checkpoint and self.training:
+                def run(*inp):
+                    return fn(*inp)
+                return torch.utils.checkpoint.checkpoint(run, *args, use_reentrant=False)
+            else:
+                return fn(*args)
+
         # encode
-        e1 = self.enc1(x, t_emb)
+        e1 = cp(self.enc1, x, t_emb)
         d1 = self.down1(e1)
-        e2 = self.enc2(d1, t_emb)
+        e2 = cp(self.enc2, d1, t_emb)
         d2 = self.down2(e2)
-        e3 = self.enc3(d2, t_emb)
+        e3 = cp(self.enc3, d2, t_emb)
+        e3 = cp(self.attn3, e3)
         d3 = self.down3(e3)
-        e4 = self.enc4(d3, t_emb)
+        e4 = cp(self.enc4, d3, t_emb)
+        e4 = cp(self.attn4, e4)
         d4 = self.down4(e4)
 
-        b = self.bot1(d4, t_emb)
-        b = self.bot2(b, t_emb)
+        b = cp(self.bot1, d4, t_emb)
+        b = cp(self.bot2, b, t_emb)
+        b = cp(self.attn_bot, b)
 
         u4 = self.up4(b)
         u4 = torch.cat([u4, e4], dim=1)
@@ -244,8 +292,10 @@ class SimpleUNet(nn.Module):
         return out  # predicted noise (same shape as x)
 
 # === モデル/最適化 ===
-# base_ch を 64→96 に増やして構造表現力を向上
-model = SimpleUNet(in_ch=3, base_ch=96, time_emb_dim=256).to(DEVICE)
+# グレースケール1ch + 自己注意。メモリ節約のためチャネル数を抑え、チェックポイントを有効化
+model = SimpleUNet(in_ch=1, base_ch=64, time_emb_dim=256, attn_heads=4, use_checkpoint=True).to(DEVICE)
+# channels_last で畳み込みのメモリ効率を改善
+model = model.to(memory_format=torch.channels_last)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
 # 学習率スケジューラ（後半で学習率を下げて細部を学習）
@@ -303,9 +353,10 @@ def p_sample(model, x_t, t):
     alpha_cumprod_t = alphas_cumprod[t].view(-1, 1, 1, 1)
     alpha_cumprod_prev_t = alphas_cumprod_prev[t].view(-1, 1, 1, 1)
 
-    # 予測ノイズ ε と x0 推定
-    eps_pred = model(x_t, t)  # shape (B,C,H,W)
-    x0_pred = (x_t - eps_pred * sqrt_one_minus_alpha_cumprod_t) / (sqrt_alpha_cumprod_t + 1e-8)
+    # 予測ベクトル v と x0 推定（v-pred）
+    v_pred = model(x_t, t)  # shape (B,C,H,W)
+    # x0 = sqrt(alpha_bar) * x_t - sqrt(1-alpha_bar) * v
+    x0_pred = (sqrt_alpha_cumprod_t * x_t) - (sqrt_one_minus_alpha_cumprod_t * v_pred)
     # 物理的画素域[-1,1]へのクリップで霧/色かぶり低減
     x0_pred = x0_pred.clamp(-1.0, 1.0)
 
@@ -335,7 +386,7 @@ def p_sample_loop(model, shape, device):
     return img
 
 # === 学習ループ ===
-scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())  # mixed precision
+scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())  # mixed precision (new API)
 
 if __name__ == "__main__":
     global_step = 0
@@ -344,7 +395,7 @@ if __name__ == "__main__":
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
         running_loss = 0.0
         for idx, batch in enumerate(pbar):
-            x0 = batch.to(DEVICE)  # [-1,1]
+            x0 = batch.to(DEVICE, non_blocking=True).to(memory_format=torch.channels_last)  # [-1,1]
             B = x0.size(0)
             # sample t uniformly for each sample in batch
             t = torch.randint(0, TIMESTEPS, (B,), device=DEVICE).long()
@@ -352,9 +403,19 @@ if __name__ == "__main__":
             x_noisy = q_sample(x0, t, noise=noise)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                eps_pred = model(x_noisy, t)
-                loss = F.mse_loss(eps_pred, noise)
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+                # v-target: v = sqrt(a_bar)*eps - sqrt(1-a_bar)*x0
+                sqrt_ab_t = sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
+                sqrt_omab_t = sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
+                v_target = sqrt_ab_t * noise - sqrt_omab_t * x0
+                v_pred = model(x_noisy, t)
+                if V_PREDICTION:
+                    # P2 loss weighting
+                    snr = (alphas_cumprod[t] / (1 - alphas_cumprod[t])).view(-1, 1, 1, 1)
+                    p2_weight = (P2_K + snr) ** (-P2_GAMMA)
+                    loss = (p2_weight * (v_pred - v_target) ** 2).mean()
+                else:
+                    loss = F.mse_loss(v_pred, v_target)
 
             scaler.scale(loss).backward()
             # 収束安定化のための軽いクリップ
@@ -396,7 +457,7 @@ if __name__ == "__main__":
             ema.store(model)          # 現在パラメータ保存 + EMA反映
             model.eval()
             sample_count = 16
-            sample_shape = (sample_count, 3, IMAGE_SIZE, IMAGE_SIZE)
+            sample_shape = (sample_count, 1, IMAGE_SIZE, IMAGE_SIZE)
 
             samples = p_sample_loop(model, sample_shape, DEVICE)
             # [-1,1] -> [0,1]
