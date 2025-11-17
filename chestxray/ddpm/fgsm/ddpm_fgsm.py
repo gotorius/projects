@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
+from torchvision.utils import make_grid, save_image
 from PIL import Image
 import pandas as pd
 import numpy as np
@@ -83,7 +84,7 @@ print("\n" + "="*70)
 print("Loading ResNet50 classifier...")
 print("="*70)
 
-clf_ckpt = "/mnt/data1/gotou/kaggle/chestxray/resnet50_models/resnet50_best.pth"
+clf_ckpt = "/mnt/data1/gotou/projects/chestxray/resnet/resnet50_best.pth"
 
 model = models.resnet50(pretrained=False)
 model.fc = nn.Linear(model.fc.in_features, 2)  # 2クラス分類
@@ -109,6 +110,26 @@ def denormalize(x_norm, mean, std):
 def renormalize(x_pixel, mean, std):
     """ピクセル空間[0,1]の画像を正規化"""
     return (x_pixel - mean) / std
+
+def rgb_to_grayscale_pixel(x_rgb_pixel):
+    """
+    RGB画像(3ch, ピクセル空間)をグレースケール(1ch)に変換
+    Args:
+        x_rgb_pixel: [B, 3, H, W] in [0, 1]
+    Returns:
+        x_gray_pixel: [B, 1, H, W] in [0, 1]
+    """
+    return x_rgb_pixel.mean(dim=1, keepdim=True)
+
+def grayscale_to_rgb_pixel(x_gray_pixel):
+    """
+    グレースケール画像(1ch, ピクセル空間)をRGB(3ch)に変換
+    Args:
+        x_gray_pixel: [B, 1, H, W] in [0, 1]
+    Returns:
+        x_rgb_pixel: [B, 3, H, W] in [0, 1]
+    """
+    return x_gray_pixel.repeat(1, 3, 1, 1)
 
 # ========== FGSM攻撃関数 ==========
 def fgsm_attack_improved(model, images, labels, epsilon_pixel, device,
@@ -229,8 +250,39 @@ class ResidualBlock(nn.Module):
         h = self.act(h)
         return h + self.skip(x)
 
+class AttentionBlock(nn.Module):
+    """Self-attention block for UNet"""
+    def __init__(self, channels, num_heads=4):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.ln = nn.LayerNorm(channels)
+        self.mha = nn.MultiheadAttention(channels, num_heads, batch_first=True)
+        self.ff = nn.Sequential(
+            nn.Linear(channels, channels * 4),
+            nn.GELU(),
+            nn.Linear(channels * 4, channels)
+        )
+    
+    def forward(self, x):
+        B, C, H, W = x.shape
+        # Reshape for attention
+        x_flat = x.view(B, C, H*W).permute(0, 2, 1)  # [B, H*W, C]
+        
+        # Self-attention with residual
+        x_norm = self.ln(x_flat)
+        attn_out, _ = self.mha(x_norm, x_norm, x_norm)
+        x_flat = x_flat + attn_out
+        
+        # Feedforward with residual
+        x_flat = x_flat + self.ff(self.ln(x_flat))
+        
+        # Reshape back
+        x_out = x_flat.permute(0, 2, 1).view(B, C, H, W)
+        return x_out
+
 class SimpleUNet(nn.Module):
-    def __init__(self, in_ch=3, base_ch=64, time_emb_dim=256):
+    def __init__(self, in_ch=1, base_ch=64, time_emb_dim=256):  # 1チャンネル用
         super().__init__()
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_emb_dim),
@@ -244,11 +296,14 @@ class SimpleUNet(nn.Module):
         self.enc2 = ResidualBlock(base_ch*2, base_ch*2, time_emb_dim)
         self.down2 = nn.Conv2d(base_ch*2, base_ch*4, 4, stride=2, padding=1)
         self.enc3 = ResidualBlock(base_ch*4, base_ch*4, time_emb_dim)
+        self.attn3 = AttentionBlock(base_ch*4, num_heads=4)  # Attention追加
         self.down3 = nn.Conv2d(base_ch*4, base_ch*8, 4, stride=2, padding=1)
         self.enc4 = ResidualBlock(base_ch*8, base_ch*8, time_emb_dim)
+        self.attn4 = AttentionBlock(base_ch*8, num_heads=4)  # Attention追加
         self.down4 = nn.Conv2d(base_ch*8, base_ch*8, 4, stride=2, padding=1)
         # Bottleneck
         self.bot1 = ResidualBlock(base_ch*8, base_ch*8, time_emb_dim)
+        self.attn_bot = AttentionBlock(base_ch*8, num_heads=4)  # Attention追加
         self.bot2 = ResidualBlock(base_ch*8, base_ch*8, time_emb_dim)
         # Decoder
         self.up4 = nn.ConvTranspose2d(base_ch*8, base_ch*8, 4, stride=2, padding=1)
@@ -272,10 +327,13 @@ class SimpleUNet(nn.Module):
         e2 = self.enc2(d1, t_emb)
         d2 = self.down2(e2)
         e3 = self.enc3(d2, t_emb)
+        e3 = self.attn3(e3)  # Attention適用
         d3 = self.down3(e3)
         e4 = self.enc4(d3, t_emb)
+        e4 = self.attn4(e4)  # Attention適用
         d4 = self.down4(e4)
         b = self.bot1(d4, t_emb)
+        b = self.attn_bot(b)  # Attention適用
         b = self.bot2(b, t_emb)
         u4 = self.up4(b)
         u4 = torch.cat([u4, e4], dim=1)
@@ -304,8 +362,8 @@ posterior_variance[1:] = betas[1:] * (1.0 - alphas_cumprod[:-1]) / (1.0 - alphas
 posterior_variance[0] = 1e-8
 
 # DDPMモデルのロード
-ddpm_ckpt = "/mnt/data1/gotou/kaggle/chestxray/ddpm_out/ddpm_epoch100.pth"
-ddpm = SimpleUNet(in_ch=3, base_ch=64, time_emb_dim=256).to(device)
+ddpm_ckpt = "/mnt/data1/gotou/projects/chestxray/ddpm/ddpm_out3/best_model.pth"
+ddpm = SimpleUNet(in_ch=1, base_ch=64, time_emb_dim=256).to(device)  # 1チャンネル用
 
 ckpt = torch.load(ddpm_ckpt, map_location=device)
 if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
@@ -317,24 +375,48 @@ ddpm.eval()
 print(f"Loaded DDPM from {ddpm_ckpt}")
 
 # ========== DDPM浄化関数 ==========
-# DDPM学習時の正規化（[-1,1]スケール）
-ddpm_mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(device)
-ddpm_std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(device)
+# DDPM学習時の正規化（[-1,1]スケール、1チャンネル用）
+ddpm_mean = torch.tensor([0.5]).view(1, 1, 1, 1).to(device)
+ddpm_std = torch.tensor([0.5]).view(1, 1, 1, 1).to(device)
 
-def prepare_for_diffusion_from_norm(x_norm, target_size=224):
-    """ImageNet正規化からDDPM用の[-1,1]正規化に変換"""
-    x_pixel = denormalize(x_norm, imagenet_mean, imagenet_std)
-    x_resized = F.interpolate(x_pixel, size=(target_size, target_size), mode="bilinear", align_corners=False)
-    x_minus1to1 = (x_resized - ddpm_mean) / ddpm_std
-    return x_minus1to1
+def prepare_for_diffusion(x_rgb_norm, target_size=224):
+    """
+    RGB正規化画像からDDPM用の1ch [-1,1]正規化画像に変換
+    Args:
+        x_rgb_norm: RGB ImageNet正規化画像 [B, 3, H, W]
+    Returns:
+        x_gray_minus1to1: グレースケール [-1,1] 正規化画像 [B, 1, H, W]
+    """
+    # RGB正規化を解除してピクセル空間に
+    x_rgb_pixel = denormalize(x_rgb_norm, imagenet_mean, imagenet_std)
+    # グレースケールに変換
+    x_gray_pixel = rgb_to_grayscale_pixel(x_rgb_pixel)
+    # リサイズ
+    x_gray_pixel = F.interpolate(x_gray_pixel, size=(target_size, target_size), 
+                                  mode="bilinear", align_corners=False)
+    # [-1, 1] に正規化
+    x_gray_minus1to1 = (x_gray_pixel - ddpm_mean) / ddpm_std
+    return x_gray_minus1to1
 
-def recover_from_diffusion_to_norm(x_minus1to1, out_size=224):
-    """DDPM用の[-1,1]正規化からImageNet正規化に変換"""
-    x_pixel = x_minus1to1 * ddpm_std + ddpm_mean
-    x_pixel = torch.clamp(x_pixel, 0.0, 1.0)
-    x_resized = F.interpolate(x_pixel, size=(out_size, out_size), mode="bilinear", align_corners=False)
-    x_norm = renormalize(x_resized, imagenet_mean, imagenet_std)
-    return x_norm
+def recover_from_diffusion(x_gray_minus1to1, out_size=224):
+    """
+    DDPM用の1ch [-1,1]正規化画像からRGB ImageNet正規化画像に変換
+    Args:
+        x_gray_minus1to1: グレースケール [-1,1] 正規化画像 [B, 1, H, W]
+    Returns:
+        x_rgb_norm: RGB ImageNet正規化画像 [B, 3, H, W]
+    """
+    # [-1, 1] 正規化を解除してピクセル空間に
+    x_gray_pixel = x_gray_minus1to1 * ddpm_std + ddpm_mean
+    x_gray_pixel = torch.clamp(x_gray_pixel, 0.0, 1.0)
+    # リサイズ
+    x_gray_pixel = F.interpolate(x_gray_pixel, size=(out_size, out_size), 
+                                  mode="bilinear", align_corners=False)
+    # RGBに変換
+    x_rgb_pixel = grayscale_to_rgb_pixel(x_gray_pixel)
+    # ImageNet正規化
+    x_rgb_norm = renormalize(x_rgb_pixel, imagenet_mean, imagenet_std)
+    return x_rgb_norm
 
 @torch.no_grad()
 def diffusion_purify(x_adv_minus1to1, model, start_t=100, T_purify=50, eta=0.0, out_mode='x0'):
@@ -401,20 +483,16 @@ print("="*70)
 epsilon_pixel = 8/255.0
 start_t = 80
 T_purify = 50
-save_examples_dir = "/mnt/data1/gotou/kaggle/chestxray/fgsm/purify_examples"
+save_examples_dir = "/mnt/data1/gotou/projects/chestxray/ddpm/fgsm/purify_examples2"
 os.makedirs(save_examples_dir, exist_ok=True)
 
-# 保存用ディレクトリ
+# triplets のみ出力
 save_triplets_dir = os.path.join(save_examples_dir, "triplets")
-save_clean_dir = os.path.join(save_examples_dir, "clean")
-save_adv_dir = os.path.join(save_examples_dir, "adversarial")
-save_pur_dir = os.path.join(save_examples_dir, "purified")
-for d in [save_triplets_dir, save_clean_dir, save_adv_dir, save_pur_dir]:
-    os.makedirs(d, exist_ok=True)
+os.makedirs(save_triplets_dir, exist_ok=True)
 
-MAX_IMAGES_TO_SAVE = 20
+# 画像保存の設定
+MAX_IMAGES_TO_SAVE = 3  # 3枚のみ保存
 saved_image_count = 0
-global_idx = 0
 
 # 統計変数
 total = 0
@@ -483,8 +561,8 @@ for batch_idx, (images_norm, labels) in enumerate(tqdm(test_loader, desc="Evalua
     l2_norms_adv.extend(l2_adv)
     linf_norms_adv.extend(linf_adv)
     
-    # 3) DDPM浄化
-    x_adv_for_diff = prepare_for_diffusion_from_norm(adv_images_norm, target_size=224)
+    # 3) DDPM浄化（RGB → 1ch グレースケールに変換してから浄化）
+    x_adv_for_diff = prepare_for_diffusion(adv_images_norm, target_size=224)
     purified_minus1to1 = diffusion_purify(
         x_adv_for_diff, ddpm, 
         start_t=start_t, 
@@ -493,8 +571,8 @@ for batch_idx, (images_norm, labels) in enumerate(tqdm(test_loader, desc="Evalua
         out_mode='x0'
     )
     
-    # 4) 浄化画像の分類
-    purified_norm = recover_from_diffusion_to_norm(purified_minus1to1, out_size=224)
+    # 4) 浄化画像の分類（1ch → RGB に変換してから分類）
+    purified_norm = recover_from_diffusion(purified_minus1to1, out_size=224)
     with torch.no_grad():
         logits_pur = model(purified_norm)
         preds_pur = torch.argmax(logits_pur, dim=1)
@@ -509,27 +587,25 @@ for batch_idx, (images_norm, labels) in enumerate(tqdm(test_loader, desc="Evalua
         l2_norms_purified.extend(l2_pur)
         linf_norms_purified.extend(linf_pur)
     
-    # 5) 画像保存
+    # 5) Triplet画像保存（最初の3枚のみ）
     if saved_image_count < MAX_IMAGES_TO_SAVE:
-        from torchvision.utils import save_image, make_grid
-        for i in range(min(len(correct_indices), MAX_IMAGES_TO_SAVE - saved_image_count)):
-            idx = saved_image_count
-            
-            # 個別画像保存
-            save_image(clean_pixel[i], os.path.join(save_clean_dir, f"clean_{idx:04d}.png"))
-            save_image(adv_pixel[i], os.path.join(save_adv_dir, f"adv_{idx:04d}.png"))
-            save_image(pur_pixel[i], os.path.join(save_pur_dir, f"purified_{idx:04d}.png"))
-            
-            # トリプレット画像
-            triplet = torch.stack([clean_pixel[i], adv_pixel[i], pur_pixel[i]], dim=0)
-            grid = make_grid(triplet, nrow=3, padding=5, pad_value=1.0)
-            save_image(grid, os.path.join(save_triplets_dir, f"triplet_{idx:04d}.png"))
-            
-            saved_image_count += 1
+        clean_pixel_save = denormalize(images_norm_correct.detach(), imagenet_mean, imagenet_std).clamp(0,1)
+        adv_pixel_save = denormalize(adv_images_norm.detach(), imagenet_mean, imagenet_std).clamp(0,1)
+        pur_pixel_save = denormalize(purified_norm.detach(), imagenet_mean, imagenet_std).clamp(0,1)
+        
+        # 224x224に統一
+        clean_resized = F.interpolate(clean_pixel_save, size=(224,224), mode="bilinear", align_corners=False)
+        adv_resized = F.interpolate(adv_pixel_save, size=(224,224), mode="bilinear", align_corners=False)
+        pur_resized = F.interpolate(pur_pixel_save, size=(224,224), mode="bilinear", align_corners=False)
+        
+        for i in range(len(correct_indices)):
             if saved_image_count >= MAX_IMAGES_TO_SAVE:
                 break
-    
-    global_idx += b
+            
+            # triplet tile のみ保存
+            row = torch.cat([clean_resized[i], adv_resized[i], pur_resized[i]], dim=2)
+            save_image(row, os.path.join(save_triplets_dir, f"{saved_image_count:05d}_triplet.png"))
+            saved_image_count += 1
 
 # ========== 結果表示 ==========
 clean_acc = correct_clean / total if total > 0 else 0.0
@@ -544,62 +620,65 @@ linf_norms_purified = np.array(linf_norms_purified)
 print("\n" + "="*70)
 print("==== Results (ChestXray - FGSM Attack + DDPM Defense) ====")
 print("="*70)
-print(f"Total samples evaluated: {total}")
+print(f"Total samples evaluated: {total} (元画像で正解したもののみ)")
 print(f"Attack: FGSM with epsilon={epsilon_pixel:.4f} ({epsilon_pixel*255:.1f}/255)")
 print(f"Purification: DDPM start_t={start_t}, T_purify={T_purify}")
 print("-"*70)
-print(f"Clean accuracy:     {clean_acc:.4f} ({correct_clean}/{total})")
-print(f"Adv (FGSM) accuracy:{adv_acc:.4f} ({correct_adv}/{total})")
-print(f"Purified accuracy:  {pur_acc:.4f} ({correct_purified}/{total})")
+print(f"Clean accuracy:     {clean_acc:.4f} (常に1.0)")
+print(f"Adv (FGSM) accuracy:{adv_acc:.4f}")
+print(f"Purified accuracy:  {pur_acc:.4f}")
 print(f"Defense improvement: {pur_acc - adv_acc:+.4f}")
 print("-"*70)
 
 print("\n" + "="*70)
 print("==== Perturbation Norms ====")
 print("="*70)
-print("Adversarial Perturbations:")
-print(f"  L2:   mean={l2_norms_adv.mean():.4f}, std={l2_norms_adv.std():.4f}")
-print(f"  L∞:   mean={linf_norms_adv.mean():.4f}, std={linf_norms_adv.std():.4f}")
+print("Adversarial Perturbations (vs Clean):")
+print(f"  L2 norm:   mean={l2_norms_adv.mean():.4f}, std={l2_norms_adv.std():.4f}, "
+      f"min={l2_norms_adv.min():.4f}, max={l2_norms_adv.max():.4f}")
+print(f"  L∞ norm:   mean={linf_norms_adv.mean():.4f}, std={linf_norms_adv.std():.4f}, "
+      f"min={linf_norms_adv.min():.4f}, max={linf_norms_adv.max():.4f}")
 print("\nPurified Images (vs Clean):")
-print(f"  L2:   mean={l2_norms_purified.mean():.4f}, std={l2_norms_purified.std():.4f}")
-print(f"  L∞:   mean={linf_norms_purified.mean():.4f}, std={linf_norms_purified.std():.4f}")
+print(f"  L2 norm:   mean={l2_norms_purified.mean():.4f}, std={l2_norms_purified.std():.4f}, "
+      f"min={l2_norms_purified.min():.4f}, max={l2_norms_purified.max():.4f}")
+print(f"  L∞ norm:   mean={linf_norms_purified.mean():.4f}, std={linf_norms_purified.std():.4f}, "
+      f"min={linf_norms_purified.min():.4f}, max={linf_norms_purified.max():.4f}")
 print("="*70)
 
-# ========== 混同行列 ==========
-def plot_confusion_matrix(y_true, y_pred, title, filename):
+print(f"\nSaved {saved_image_count} triplet images to: {save_triplets_dir}")
+
+# ========== 混同行列の計算(テキスト形式のみ) ==========
+def print_confusion_matrix(y_true, y_pred, title):
     cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=['NORMAL', 'PNEUMONIA'],
-                yticklabels=['NORMAL', 'PNEUMONIA'])
-    plt.title(title, fontsize=14, fontweight='bold')
-    plt.ylabel('True Label', fontsize=12)
-    plt.xlabel('Predicted Label', fontsize=12)
-    plt.tight_layout()
-    plt.savefig(filename, dpi=150, bbox_inches='tight')
-    plt.close()
-    
     tn, fp, fn, tp = cm.ravel()
+    print(f"\n{title}:")
+    print(f"  Confusion Matrix:")
+    print(f"                Predicted")
+    print(f"                NORMAL  PNEUMONIA")
+    print(f"  Actual NORMAL    {tn:5d}  {fp:5d}")
+    print(f"         PNEUMONIA {fn:5d}  {tp:5d}")
+    print(f"  True Negatives:  {tn}")
+    print(f"  False Positives: {fp}")
+    print(f"  False Negatives: {fn}")
+    print(f"  True Positives:  {tp}")
     precision = tp/(tp+fp) if (tp+fp)>0 else 0.0
     recall = tp/(tp+fn) if (tp+fn)>0 else 0.0
     f1 = (2*precision*recall)/(precision+recall) if (precision+recall)>0 else 0.0
-    
-    print(f"\n{title}:")
-    print(f"  TN={tn}, FP={fp}, FN={fn}, TP={tp}")
-    print(f"  Precision={precision:.4f}, Recall={recall:.4f}, F1={f1:.4f}")
+    print(f"  Precision: {precision:.4f}")
+    print(f"  Recall:    {recall:.4f}")
+    print(f"  F1-Score:  {f1:.4f}")
 
-print("\n" + "="*50)
-print("Generating confusion matrices...")
-print("="*50)
+print("\n" + "="*70)
+print("Confusion Matrix Analysis")
+print("="*70)
 
-plot_confusion_matrix(all_labels, all_preds_clean, "Clean Images",
-                     os.path.join(save_examples_dir, "cm_clean.png"))
-plot_confusion_matrix(all_labels, all_preds_adv, "Adversarial (FGSM)",
-                     os.path.join(save_examples_dir, "cm_adversarial.png"))
-plot_confusion_matrix(all_labels, all_preds_purified, "Purified Images",
-                     os.path.join(save_examples_dir, "cm_purified.png"))
+print_confusion_matrix(all_labels, all_preds_clean, "Clean Images")
+print_confusion_matrix(all_labels, all_preds_adv, "Adversarial (FGSM)")
+print_confusion_matrix(all_labels, all_preds_purified, "Purified Images")
 
-# ========== 統計をCSVに保存 ==========
+print("="*70)
+
+# ========== 詳細統計をCSVに保存 ==========
 stats_df = pd.DataFrame({
     'true_label': all_labels,
     'pred_clean': all_preds_clean,
@@ -617,34 +696,76 @@ stats_df['defense_recovery'] = ((stats_df['attack_success'] == 1) & (stats_df['p
 
 csv_path = os.path.join(save_examples_dir, 'detailed_results.csv')
 stats_df.to_csv(csv_path, index=False)
-print(f"\n✅ Results saved to: {csv_path}")
+print(f"\n✅ Detailed statistics saved to: {csv_path}")
 
-# サマリー統計
+# サマリー統計をテキストファイルに保存
 summary_path = os.path.join(save_examples_dir, 'summary_statistics.txt')
 with open(summary_path, 'w') as f:
     f.write("="*70 + "\n")
     f.write("ChestXray - FGSM Attack + DDPM Defense Summary\n")
     f.write("="*70 + "\n\n")
     f.write(f"Dataset: ChestXray (NORMAL vs PNEUMONIA)\n")
-    f.write(f"Attack: FGSM, epsilon={epsilon_pixel:.4f} ({epsilon_pixel*255:.1f}/255)\n")
-    f.write(f"Defense: DDPM, start_t={start_t}, T_purify={T_purify}\n")
+    f.write(f"Attack Parameters:\n")
+    f.write(f"  Method: FGSM (Fast Gradient Sign Method)\n")
+    f.write(f"  Epsilon: {epsilon_pixel:.4f} ({epsilon_pixel*255:.1f}/255)\n\n")
+    f.write(f"Purification Parameters:\n")
+    f.write(f"  Method: DDPM (Denoising Diffusion Probabilistic Model)\n")
+    f.write(f"  Start timestep (t): {start_t}\n")
+    f.write(f"  Purification steps: {T_purify}\n")
+    f.write(f"  Checkpoint: {ddpm_ckpt}\n\n")
     f.write(f"Classifier: {clf_ckpt}\n")
-    f.write(f"  Best Val Acc: {checkpoint.get('best_val_acc', 'N/A')}\n")
-    f.write(f"DDPM Model: {ddpm_ckpt}\n\n")
+    f.write(f"  Best Val Acc: {checkpoint.get('best_val_acc', 'N/A')}\n\n")
     f.write("-"*70 + "\n")
-    f.write(f"Results on {total} correctly classified images:\n")
+    f.write(f"Results (evaluated on {total} correctly classified images):\n")
     f.write("-"*70 + "\n")
-    f.write(f"Clean Accuracy:      {clean_acc:.4f}\n")
-    f.write(f"Adversarial Accuracy:{adv_acc:.4f}\n")
-    f.write(f"Purified Accuracy:   {pur_acc:.4f}\n")
+    f.write(f"Clean Accuracy:      {clean_acc:.4f} ({correct_clean}/{total})\n")
+    f.write(f"Adversarial Accuracy:{adv_acc:.4f} ({correct_adv}/{total})\n")
+    f.write(f"Purified Accuracy:   {pur_acc:.4f} ({correct_purified}/{total})\n")
     f.write(f"Defense Improvement: {pur_acc - adv_acc:+.4f}\n")
     f.write(f"Attack Success Rate: {1 - adv_acc:.4f}\n")
     if (total - correct_adv) > 0:
         defense_rate = (correct_purified - correct_adv) / (total - correct_adv)
-        f.write(f"Defense Success Rate:{defense_rate:.4f}\n")
+        f.write(f"Defense Success Rate:{defense_rate:.4f} (on attacked samples)\n")
+    f.write("\n" + "="*70 + "\n")
+    f.write("Perturbation Norms:\n")
+    f.write("="*70 + "\n")
+    f.write("Adversarial Perturbations (vs Clean):\n")
+    f.write(f"  L2 norm:   mean={l2_norms_adv.mean():.6f}, std={l2_norms_adv.std():.6f}\n")
+    f.write(f"             min={l2_norms_adv.min():.6f}, max={l2_norms_adv.max():.6f}\n")
+    f.write(f"             median={np.median(l2_norms_adv):.6f}\n")
+    f.write(f"  L∞ norm:   mean={linf_norms_adv.mean():.6f}, std={linf_norms_adv.std():.6f}\n")
+    f.write(f"             min={linf_norms_adv.min():.6f}, max={linf_norms_adv.max():.6f}\n")
+    f.write(f"             median={np.median(linf_norms_adv):.6f}\n\n")
+    f.write("Purified Images (vs Clean):\n")
+    f.write(f"  L2 norm:   mean={l2_norms_purified.mean():.6f}, std={l2_norms_purified.std():.6f}\n")
+    f.write(f"             min={l2_norms_purified.min():.6f}, max={l2_norms_purified.max():.6f}\n")
+    f.write(f"             median={np.median(l2_norms_purified):.6f}\n")
+    f.write(f"  L∞ norm:   mean={linf_norms_purified.mean():.6f}, std={linf_norms_purified.std():.6f}\n")
+    f.write(f"             min={linf_norms_purified.min():.6f}, max={linf_norms_purified.max():.6f}\n")
+    f.write(f"             median={np.median(linf_norms_purified):.6f}\n\n")
+    f.write("="*70 + "\n")
+    f.write("Confusion Matrix Statistics:\n")
+    f.write("="*70 + "\n")
+    for name, preds in [("Clean", all_preds_clean), ("Adversarial", all_preds_adv), ("Purified", all_preds_purified)]:
+        cm = confusion_matrix(all_labels, preds)
+        tn, fp, fn, tp = cm.ravel()
+        precision = tp/(tp+fp) if (tp+fp)>0 else 0.0
+        recall = tp/(tp+fn) if (tp+fn)>0 else 0.0
+        f1 = (2*precision*recall)/(precision+recall) if (precision+recall)>0 else 0.0
+        specificity = tn/(tn+fp) if (tn+fp)>0 else 0.0
+        f.write(f"\n{name} Images:\n")
+        f.write(f"  TN: {tn:4d}  FP: {fp:4d}  FN: {fn:4d}  TP: {tp:4d}\n")
+        f.write(f"  Precision:   {precision:.4f}\n")
+        f.write(f"  Recall:      {recall:.4f}\n")
+        f.write(f"  F1-Score:    {f1:.4f}\n")
+        f.write(f"  Specificity: {specificity:.4f}\n")
 
-print(f"✅ Summary saved to: {summary_path}")
-print(f"✅ Saved {saved_image_count} example images")
+print(f"✅ Summary statistics saved to: {summary_path}")
+
 print("\n" + "="*70)
-print("Evaluation completed successfully!")
+print("All evaluations completed successfully!")
 print("="*70)
+print(f"\nAll results saved in: {save_examples_dir}")
+print(f"  - Triplet images: {save_triplets_dir}")
+print(f"  - Detailed results: {csv_path}")
+print(f"  - Summary: {summary_path}")
