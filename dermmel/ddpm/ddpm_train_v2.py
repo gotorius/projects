@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 DATA_DIR = '/mnt/data1/Public/MedImages/DermMel'
 # DermMel 用: train_sep 配下にクラス別フォルダ (e.g., Melanoma/ NotMelanoma/) がある前提
 TRAIN_IMG_DIR = os.path.join(DATA_DIR, 'train_sep')
-OUT_DIR = os.path.join('/mnt/data1/gotou/project/dermmel', 'ddpm_out2')
+OUT_DIR = os.path.join('/mnt/data1/gotou/projects/dermmel/ddpm', 'ddpm_out2')
 os.makedirs(OUT_DIR, exist_ok=True)
 
 IMAGE_SIZE = 224
