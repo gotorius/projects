@@ -41,7 +41,8 @@ def get_args():
     parser.add_argument('--resume', type=str, default=None, help='再開するチェックポイント')
     parser.add_argument('--seed', type=int, default=42, help='乱数シード')
     parser.add_argument('--save_every', type=int, default=10, help='保存間隔(epochs)')
-    parser.add_argument('--gpu_id', type=int, default=1, help='使用するGPU ID')
+    parser.add_argument('--gpu_id', type=int, default=0, help='使用するGPU ID')
+    parser.add_argument('--patience', type=int, default=5, help='Early stopping patience (epochs)')
     return parser.parse_args()
 
 
@@ -388,6 +389,9 @@ def train(args):
     start_epoch = 0
     all_losses = []
     epoch_losses = []
+    best_loss = float('inf')
+    patience_counter = 0
+    early_stopped = False
     
     if args.resume:
         print(f'\nResuming from: {args.resume}')
@@ -402,6 +406,7 @@ def train(args):
     # Training loop
     print(f'\nStarting training for {args.epochs} epochs...')
     print(f'Batch size: {args.batch_size}, Image size: {args.image_size}, LR: {args.lr}')
+    print(f'Early stopping patience: {args.patience} epochs')
     
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -433,6 +438,36 @@ def train(args):
         avg_loss = running_loss / len(dataloader)
         epoch_losses.append(avg_loss)
         print(f'Epoch {epoch+1} | Avg Loss: {avg_loss:.6f}')
+        
+        # Early stopping check
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            patience_counter = 0
+            
+            # Save best model
+            best_path = os.path.join(args.save_dir, 'best_model.pth')
+            ema.apply(model)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
+                'ema_state_dict': ema.shadow,
+                'best_loss': best_loss,
+                'all_losses': all_losses,
+                'epoch_losses': epoch_losses,
+                'args': vars(args),
+            }, best_path)
+            ema.restore(model)
+            print(f'*** Best model saved! (Loss: {best_loss:.6f}) ***')
+        else:
+            patience_counter += 1
+            print(f'No improvement for {patience_counter}/{args.patience} epochs')
+            
+            if patience_counter >= args.patience:
+                print(f'\n*** Early stopping triggered after {epoch+1} epochs ***')
+                early_stopped = True
+                break
         
         # Save checkpoint and samples
         if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
@@ -468,9 +503,10 @@ def train(args):
     print('\nGenerating loss plots...')
     plot_losses(all_losses, epoch_losses, args.save_dir)
     
-    # Final: Generate best samples
-    print('\nGenerating final samples with EMA model...')
-    ema.apply(model)
+    # Final: Load best model and generate samples
+    print('\nGenerating final samples with best model...')
+    best_ckpt = torch.load(os.path.join(args.save_dir, 'best_model.pth'), map_location=device)
+    model.load_state_dict(best_ckpt['model_state_dict'])
     model.eval()
     
     for i in range(3):
@@ -492,7 +528,9 @@ def train(args):
     
     print(f'\n{"="*60}')
     print('Training completed!')
-    print(f'Best epoch loss: {min(epoch_losses):.6f}')
+    if early_stopped:
+        print(f'Early stopped at epoch {len(epoch_losses)}')
+    print(f'Best epoch loss: {best_loss:.6f}')
     print(f'Models saved to: {args.save_dir}')
     print(f'Samples saved to: {samples_dir}')
     print(f'{"="*60}')

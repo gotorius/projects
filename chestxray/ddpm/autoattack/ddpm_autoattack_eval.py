@@ -76,7 +76,13 @@ def parse_args():
     parser.add_argument('--data_seed', type=int, default=0,
                         help='Data random seed')
     parser.add_argument('--num_samples', type=int, default=500,
-                        help='Number of samples to evaluate (0 for all)')
+                        help='Number of correctly classified samples to evaluate')
+    
+    # 画像セットの保存/再利用
+    parser.add_argument('--use_cached_samples', type=str, default=None,
+                        help='Path to cached samples (.pt file). If provided, load samples from this file instead of selecting new ones')
+    parser.add_argument('--save_samples_path', type=str, default=None,
+                        help='Path to save selected samples (.pt file) for reuse with other defense models')
     
     # パス設定
     parser.add_argument('--data_dir', type=str, 
@@ -93,7 +99,7 @@ def parse_args():
                         help='Output directory')
     
     # GPU設定
-    parser.add_argument('--gpu', type=int, default=0,
+    parser.add_argument('--gpu', type=int, default=1,
                         help='GPU ID to use')
     
     return parser.parse_args()
@@ -468,8 +474,31 @@ class DDPMDefenseWrapper(nn.Module):
 
 
 # ========== データ読み込み ==========
-def load_data(args):
-    """テストデータを読み込み"""
+def load_data(args, classifier_model=None, device=None):
+    """テストデータを読み込み
+    
+    Args:
+        args: コマンドライン引数
+        classifier_model: 分類器モデル（正解画像のフィルタリング用）
+        device: デバイス
+    
+    Returns:
+        x_test: テスト画像 [0,1]
+        y_test: ラベル
+        indices: 選択されたインデックス（再利用用）
+    """
+    # キャッシュされたサンプルを使用
+    if args.use_cached_samples is not None:
+        print(f"\nLoading cached samples from: {args.use_cached_samples}")
+        cached = torch.load(args.use_cached_samples)
+        x_test = cached['x_test']
+        y_test = cached['y_test']
+        indices = cached.get('indices', None)
+        print(f"Loaded {len(x_test)} cached samples")
+        if indices is not None:
+            print(f"Original indices: {indices[:10].tolist()}... (showing first 10)")
+        return x_test, y_test, indices
+    
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
@@ -478,24 +507,83 @@ def load_data(args):
     test_dir = os.path.join(args.data_dir, 'test')
     test_dataset = ChestXrayDataset(test_dir, transform)
     
-    # サンプル数制限
-    if args.num_samples > 0 and args.num_samples < len(test_dataset):
-        np.random.seed(args.data_seed)
-        indices = np.random.choice(len(test_dataset), args.num_samples, replace=False)
-        test_dataset = torch.utils.data.Subset(test_dataset, indices)
-    
     # 全データをテンソルに変換
+    print("\nLoading all test data...")
     loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
-    x_list, y_list = [], []
+    x_all, y_all = [], []
     for images, labels in tqdm(loader, desc="Loading data"):
-        x_list.append(images)
-        y_list.append(labels)
+        x_all.append(images)
+        y_all.append(labels)
     
-    x_test = torch.cat(x_list, dim=0)
-    y_test = torch.cat(y_list, dim=0)
+    x_all = torch.cat(x_all, dim=0)
+    y_all = torch.cat(y_all, dim=0)
+    print(f"Total test samples: {len(x_all)}")
     
-    print(f"Loaded {len(x_test)} test samples")
-    return x_test, y_test
+    # 分類器が正解した画像のみを選択
+    if classifier_model is not None and args.num_samples > 0:
+        print(f"\nFiltering correctly classified samples...")
+        correct_indices = []
+        
+        with torch.no_grad():
+            n_batches = (len(x_all) + args.batch_size - 1) // args.batch_size
+            for i in tqdm(range(n_batches), desc="Checking predictions"):
+                start = i * args.batch_size
+                end = min(start + args.batch_size, len(x_all))
+                x_batch = x_all[start:end].to(device)
+                y_batch = y_all[start:end].to(device)
+                
+                pred = classifier_model(x_batch).argmax(dim=1)
+                correct_mask = (pred == y_batch)
+                
+                # 正解したインデックスを記録
+                batch_indices = torch.arange(start, end)[correct_mask.cpu()]
+                correct_indices.extend(batch_indices.tolist())
+        
+        print(f"Correctly classified: {len(correct_indices)} / {len(x_all)} ({100*len(correct_indices)/len(x_all):.1f}%)")
+        
+        # ランダムにnum_samples枚を選択
+        np.random.seed(args.data_seed)
+        if len(correct_indices) > args.num_samples:
+            selected_indices = np.random.choice(correct_indices, args.num_samples, replace=False)
+        else:
+            selected_indices = np.array(correct_indices)
+            print(f"Warning: Only {len(correct_indices)} correct samples available, using all of them")
+        
+        selected_indices = np.sort(selected_indices)  # ソートして順序を固定
+        x_test = x_all[selected_indices]
+        y_test = y_all[selected_indices]
+        indices = torch.tensor(selected_indices)
+        
+        print(f"Selected {len(x_test)} correctly classified samples")
+    else:
+        # 従来の動作：ランダムに選択
+        if args.num_samples > 0 and args.num_samples < len(x_all):
+            np.random.seed(args.data_seed)
+            selected_indices = np.random.choice(len(x_all), args.num_samples, replace=False)
+            selected_indices = np.sort(selected_indices)
+            x_test = x_all[selected_indices]
+            y_test = y_all[selected_indices]
+            indices = torch.tensor(selected_indices)
+        else:
+            x_test = x_all
+            y_test = y_all
+            indices = torch.arange(len(x_all))
+        
+        print(f"Selected {len(x_test)} samples (without filtering)")
+    
+    # サンプルを保存（他の防御モデルで再利用するため）
+    if args.save_samples_path is not None:
+        os.makedirs(os.path.dirname(args.save_samples_path), exist_ok=True)
+        torch.save({
+            'x_test': x_test,
+            'y_test': y_test,
+            'indices': indices,
+            'data_seed': args.data_seed,
+            'num_samples': len(x_test),
+        }, args.save_samples_path)
+        print(f"Saved samples to: {args.save_samples_path}")
+    
+    return x_test, y_test, indices
 
 
 # ========== モデル読み込み ==========
@@ -715,14 +803,8 @@ def main():
     print(f"\nUsing GPU: {args.gpu}")
     print(f"Device: {device}")
     
-    # 出力ディレクトリ
-    attack_name = args.attack_version if args.attack_version != 'custom' else args.attack_type
-    log_dir = os.path.join(
-        args.output_dir,
-        f'{attack_name}_{args.lp_norm}_eps{int(args.adv_eps*255)}',
-        f'start{args.start_t}_purify{args.T_purify}',
-        f'seed{args.seed}_data{args.data_seed}'
-    )
+    # 出力ディレクトリ（シンプルにoutput_dir直下）
+    log_dir = args.output_dir
     os.makedirs(log_dir, exist_ok=True)
     print(f"Output directory: {log_dir}")
     
@@ -741,13 +823,19 @@ def main():
     classifier_model = ClassifierWrapper(classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
     defense_model = DDPMDefenseWrapper(purifier, classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
     
-    # データ読み込み
-    x_test, y_test = load_data(args)
-    
     # クラス名取得
     test_dir = os.path.join(args.data_dir, 'test')
     classes = sorted([d.name for d in Path(test_dir).iterdir() if d.is_dir()])
     print(f"Classes: {classes}")
+    
+    # データ読み込み（正解画像のみをフィルタリング）
+    x_test, y_test, sample_indices = load_data(args, classifier_model, device)
+    
+    # サンプル情報を出力
+    if args.use_cached_samples:
+        print(f"Using cached samples from: {args.use_cached_samples}")
+    else:
+        print(f"Selected {len(x_test)} correctly classified samples")
     
     # AutoAttack評価
     results, x_adv = eval_autoattack(
@@ -826,7 +914,12 @@ def main():
         f.write(f"Norm: {args.lp_norm}, Epsilon: {args.adv_eps:.4f}\n")
         f.write(f"DDPM: start_t={args.start_t}, T_purify={args.T_purify}\n")
         f.write(f"Note: DDPM trained on grayscale\n")
-        f.write(f"Samples: {len(x_test)}\n\n")
+        f.write(f"Samples: {len(x_test)} (correctly classified only)\n")
+        if args.use_cached_samples:
+            f.write(f"Cached samples: {args.use_cached_samples}\n")
+        if args.save_samples_path:
+            f.write(f"Samples saved to: {args.save_samples_path}\n")
+        f.write(f"Data seed: {args.data_seed}\n\n")
         f.write("-"*70 + "\n")
         f.write("Clean Accuracy:\n")
         f.write(f"  Classifier only:          {results['non_adaptive']['clean_acc_classifier']:.4f}\n")
