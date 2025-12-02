@@ -108,7 +108,9 @@ class ClassifierWrapper(nn.Module):
     
     def forward(self, x):
         """x: [0,1]の画像 → 2クラスロジット"""
-        x_norm = (x - self.mean) / self.std
+        mean = self.mean.to(x.device)
+        std = self.std.to(x.device)
+        x_norm = (x - mean) / std
         return self.classifier(x_norm)
 
 
@@ -161,7 +163,9 @@ class JPEGDefenseWrapper(nn.Module):
     def forward(self, x):
         """x: [0,1]の画像 → JPEG圧縮 → 2クラスロジット"""
         x_compressed = self.jpeg_defense(x)
-        x_norm = (x_compressed - self.mean) / self.std
+        mean = self.mean.to(x_compressed.device)
+        std = self.std.to(x_compressed.device)
+        x_norm = (x_compressed - mean) / std
         return self.classifier(x_norm)
 
 

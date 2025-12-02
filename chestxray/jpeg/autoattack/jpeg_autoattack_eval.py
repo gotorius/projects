@@ -112,7 +112,9 @@ class ClassifierWrapper(nn.Module):
     
     def forward(self, x):
         """x: [0,1]の画像 → 2クラスロジット"""
-        x_norm = (x - self.mean) / self.std
+        mean = self.mean.to(x.device)
+        std = self.std.to(x.device)
+        x_norm = (x - mean) / std
         return self.classifier(x_norm)
 
 
@@ -165,7 +167,9 @@ class JPEGDefenseWrapper(nn.Module):
     def forward(self, x):
         """x: [0,1]の画像 → JPEG圧縮 → 2クラスロジット"""
         x_compressed = self.jpeg_defense(x)
-        x_norm = (x_compressed - self.mean) / self.std
+        mean = self.mean.to(x_compressed.device)
+        std = self.std.to(x_compressed.device)
+        x_norm = (x_compressed - mean) / std
         return self.classifier(x_norm)
 
 
@@ -270,7 +274,8 @@ def run_autoattack(model, x_test, y_test, epsilon, version, device, batch_size=3
     """AutoAttackを実行して敵対的サンプルを生成"""
     print(f"\nRunning AutoAttack with epsilon={epsilon:.4f}, version={version}...")
     
-    adversary = AutoAttack(model, norm='Linf', eps=epsilon, version=version, verbose=True)
+    # デバイスを明示的に指定してAutoAttackを初期化
+    adversary = AutoAttack(model, norm='Linf', eps=epsilon, version=version, verbose=True, device=device)
     adversary.seed = 42
     
     x_adv = adversary.run_standard_evaluation(

@@ -255,7 +255,7 @@ print("="*70)
 # 実験パラメータ
 epsilon_pixel = 8/255.0
 start_t = 80  # 自前DDPMと同じ設定
-T_purify = 80  # 逆拡散ステップ数
+T_purify = 50  # 逆拡散ステップ数
 save_examples_dir = "/mnt/data1/gotou/projects/chestxray/imagenet/fgsm/guided_diffusion_examples3"
 os.makedirs(save_examples_dir, exist_ok=True)
 

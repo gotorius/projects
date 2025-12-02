@@ -1,29 +1,31 @@
 """
-ChestX-ray Dataset - FGSM Attack + JPEG Compression Defense
+ChestX-ray Dataset - PGD Attack + Guided-Diffusion (ImageNet Pretrained) Defense
 DiffPureスタイルの敵対的防御検証スクリプト
 
 評価内容:
 1. クリーン画像の分類精度
-2. クリーン画像をJPEG圧縮した後の分類精度
-3. FGSM敵対的画像の分類精度（防御なし）
-4. FGSM敵対的画像をJPEG圧縮した後の分類精度（防御あり）
+2. クリーン画像を浄化した後の分類精度
+3. PGD敵対的画像の分類精度（防御なし）
+4. PGD敵対的画像を浄化した後の分類精度（防御あり）
 """
 
 """
-# 基本実行（デフォルト設定: quality=11）
-python jpeg_fgsm_eval.py
+# 基本実行（デフォルト設定）
+python imagenet_pgd_eval.py
 
 # パラメータ指定
-python jpeg_fgsm_eval.py \
+python imagenet_pgd_eval.py \
     --epsilon 0.03137 \
-    --quality 11 \
+    --alpha 0.00784 \
+    --steps 10 \
+    --start_t 80 \
+    --T_purify 50 \
     --cached_samples /mnt/data1/gotou/projects/chestxray/correct_samples_500.pt \
     --gpu 0
 """
 
 import os
 import sys
-import io
 import argparse
 import random
 import time
@@ -41,21 +43,36 @@ from PIL import Image
 from datetime import datetime
 from tqdm.auto import tqdm
 
+# Guided-diffusionモジュールのインポート
+sys.path.insert(0, '/mnt/data1/gotou/kaggle/guided-diffusion')
+from guided_diffusion.script_util import (
+    model_and_diffusion_defaults,
+    create_model_and_diffusion,
+)
+
 
 # ========== 引数パーサー ==========
 def parse_args():
-    parser = argparse.ArgumentParser(description='ChestX-ray FGSM Attack + JPEG Defense')
+    parser = argparse.ArgumentParser(description='ChestX-ray PGD Attack + Guided-Diffusion Defense')
     
     # 攻撃設定
     parser.add_argument('--epsilon', type=float, default=8/255,
-                        help='FGSM perturbation epsilon (pixel scale 0-1)')
+                        help='PGD perturbation epsilon (pixel scale 0-1)')
+    parser.add_argument('--alpha', type=float, default=2/255,
+                        help='PGD step size (pixel scale 0-1)')
+    parser.add_argument('--steps', type=int, default=10,
+                        help='Number of PGD steps')
     
-    # JPEG圧縮設定
-    parser.add_argument('--quality', type=int, default=11,
-                        help='JPEG compression quality (1-100, lower = more compression)')
+    # 拡散モデル浄化設定
+    parser.add_argument('--start_t', type=int, default=80,
+                        help='Diffusion start timestep')
+    parser.add_argument('--T_purify', type=int, default=50,
+                        help='Number of purification steps')
+    parser.add_argument('--eta', type=float, default=0.0,
+                        help='DDIM sampling eta (0=deterministic)')
     
     # 実行設定
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for evaluation')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
@@ -69,15 +86,18 @@ def parse_args():
     parser.add_argument('--data_dir', type=str, 
                         default='/mnt/data1/Public/MedImages/CellData/chest_xray',
                         help='Data directory')
+    parser.add_argument('--diffusion_ckpt', type=str, 
+                        default='/mnt/data1/gotou/kaggle/guided-diffusion/256x256_diffusion_uncond.pt',
+                        help='Guided-Diffusion checkpoint path')
     parser.add_argument('--clf_ckpt', type=str,
                         default='/mnt/data1/gotou/projects/chestxray/resnet/resnet50_best.pth',
                         help='Classifier checkpoint path')
     parser.add_argument('--output_dir', type=str,
-                        default='/mnt/data1/gotou/projects/chestxray/jpeg/fgsm/results',
+                        default='/mnt/data1/gotou/projects/chestxray/imagenet/pgd/results',
                         help='Output directory')
     
     # GPU設定
-    parser.add_argument('--gpu', type=int, default=2,
+    parser.add_argument('--gpu', type=int, default=1,
                         help='GPU ID to use')
     
     return parser.parse_args()
@@ -91,88 +111,150 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 # ========== 分類器ラッパー ==========
 class ClassifierWrapper(nn.Module):
     """分類器のラッパー
-    入力: [0,1]のRGB画像
+    入力: [0,1]のRGB画像 (任意サイズ)
     出力: 2クラスロジット
     """
-    def __init__(self, classifier, mean, std):
+    def __init__(self, classifier, mean, std, input_size=224):
         super().__init__()
         self.classifier = classifier
+        self.input_size = input_size
         self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
     
     def forward(self, x):
         """x: [0,1]の画像 → 2クラスロジット"""
+        # 分類器入力サイズにリサイズ
+        if x.shape[-1] != self.input_size or x.shape[-2] != self.input_size:
+            x = F.interpolate(x, size=(self.input_size, self.input_size), mode='bilinear', align_corners=False)
+        
         mean = self.mean.to(x.device)
         std = self.std.to(x.device)
         x_norm = (x - mean) / std
         return self.classifier(x_norm)
 
 
-# ========== JPEG圧縮防御クラス ==========
-class JPEGDefense(nn.Module):
-    """JPEG圧縮による防御処理
+# ========== Guided-Diffusion浄化クラス ==========
+class GuidedDiffusionPurifier(nn.Module):
+    """Guided-Diffusion (ImageNet Pretrained) による浄化
     
     入力: RGB画像 [0,1]
-    出力: JPEG圧縮後のRGB画像 [0,1]
+    出力: 浄化後のRGB画像 [0,1]
     """
-    def __init__(self, quality=11):
+    def __init__(self, diffusion_model, diffusion, device, start_t=80, T_purify=50, eta=0.0):
         super().__init__()
-        self.quality = quality
+        self.model = diffusion_model
+        self.diffusion = diffusion
+        self.device = device
+        self.start_t = start_t
+        self.T_purify = T_purify
+        self.eta = eta
     
-    def compress_single(self, img_tensor):
-        """単一画像のJPEG圧縮"""
-        img = img_tensor.detach().clamp(0, 1).cpu()
-        arr = (img.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)  # HWC, uint8
-        pil = Image.fromarray(arr)
-        buf = io.BytesIO()
-        # subsampling=0 で 4:4:4 を指定
-        pil.save(buf, format='JPEG', quality=self.quality, subsampling=0, optimize=True)
-        buf.seek(0)
-        pil_j = Image.open(buf).convert('RGB')
-        arr_j = np.array(pil_j).astype(np.float32) / 255.0
-        ten_j = torch.from_numpy(arr_j).permute(2, 0, 1)  # CHW
-        return ten_j
+    def pixel_to_diffusion(self, x_pixel):
+        """[0,1] → [-1,1]"""
+        return x_pixel * 2.0 - 1.0
     
-    def forward(self, x):
-        """バッチ処理"""
-        device = x.device
-        x_list = []
-        for i in range(x.size(0)):
-            x_list.append(self.compress_single(x[i]))
-        return torch.stack(x_list, dim=0).to(device)
+    def diffusion_to_pixel(self, x_diff):
+        """[-1,1] → [0,1]"""
+        return torch.clamp((x_diff + 1.0) / 2.0, 0, 1)
+    
+    @torch.no_grad()
+    def purify(self, x_pixel):
+        """
+        RGB画像 [0,1] を浄化
+        
+        注意: 入力は224x224だが、Guided-Diffusionは256x256を期待
+        """
+        b = x_pixel.size(0)
+        original_size = x_pixel.shape[-2:]
+        
+        # 256x256にリサイズ（Guided-Diffusionの入力サイズ）
+        if original_size != (256, 256):
+            x_pixel = F.interpolate(x_pixel, size=(256, 256), mode='bilinear', align_corners=False)
+        
+        # [0,1] → [-1,1]
+        x_diff = self.pixel_to_diffusion(x_pixel)
+        
+        # Forward diffusion to start_t
+        t = torch.full((b,), self.start_t, device=self.device, dtype=torch.long)
+        noise = torch.randn_like(x_diff)
+        x_t = self.diffusion.q_sample(x_diff, t, noise=noise)
+        
+        # Reverse diffusion
+        end_t = max(self.start_t - self.T_purify, 0)
+        indices = list(range(self.start_t, end_t, -1))
+        
+        for i in indices:
+            t = torch.full((b,), i, device=self.device, dtype=torch.long)
+            
+            # モデル予測
+            out = self.diffusion.p_mean_variance(
+                self.model, x_t, t,
+                clip_denoised=True,
+                denoised_fn=None,
+                model_kwargs={}
+            )
+            
+            # DDIM step
+            if i > 0:
+                nonzero_mask = (t != 0).float().view(-1, 1, 1, 1)
+                x_t = out["mean"] + nonzero_mask * (self.eta * torch.sqrt(out["variance"])) * torch.randn_like(x_t)
+            else:
+                x_t = out["mean"]
+        
+        x_purified = torch.clamp(x_t, -1.0, 1.0)
+        
+        # [-1,1] → [0,1]
+        x_purified_pixel = self.diffusion_to_pixel(x_purified)
+        
+        # 元のサイズに戻す
+        if original_size != (256, 256):
+            x_purified_pixel = F.interpolate(x_purified_pixel, size=original_size, mode='bilinear', align_corners=False)
+        
+        return x_purified_pixel
+    
+    def forward(self, x_pixel):
+        return self.purify(x_pixel)
 
 
-class JPEGDefenseWrapper(nn.Module):
-    """JPEG圧縮 + 分類器のラッパー
+class DiffusionDefenseWrapper(nn.Module):
+    """Guided-Diffusion浄化 + 分類器のラッパー
     入力: [0,1]のRGB画像
     出力: 2クラスロジット
     """
-    def __init__(self, jpeg_defense, classifier, mean, std):
+    def __init__(self, purifier, classifier, mean, std, input_size=224):
         super().__init__()
-        self.jpeg_defense = jpeg_defense
+        self.purifier = purifier
         self.classifier = classifier
+        self.input_size = input_size
         self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
     
     def forward(self, x):
-        """x: [0,1]の画像 → JPEG圧縮 → 2クラスロジット"""
-        x_compressed = self.jpeg_defense(x)
-        mean = self.mean.to(x_compressed.device)
-        std = self.std.to(x_compressed.device)
-        x_norm = (x_compressed - mean) / std
+        """x: [0,1]の画像 → 浄化 → 2クラスロジット"""
+        x_purified = self.purifier(x)
+        
+        # 分類器入力サイズにリサイズ
+        if x_purified.shape[-1] != self.input_size or x_purified.shape[-2] != self.input_size:
+            x_purified = F.interpolate(x_purified, size=(self.input_size, self.input_size), mode='bilinear', align_corners=False)
+        
+        mean = self.mean.to(x_purified.device)
+        std = self.std.to(x_purified.device)
+        x_norm = (x_purified - mean) / std
         return self.classifier(x_norm)
 
 
-# ========== FGSM攻撃 ==========
-def fgsm_attack(model, x, y, epsilon, device):
+# ========== PGD攻撃 ==========
+def pgd_attack(model, x, y, epsilon, alpha, steps, device):
     """
-    FGSM攻撃
+    PGD攻撃
     
     Args:
         model: 分類器（入力は[0,1]のRGB画像）
         x: 入力画像 [B, 3, H, W] in [0, 1]
         y: ラベル [B]
         epsilon: 摂動の大きさ（ピクセルスケール 0-1）
+        alpha: ステップサイズ（ピクセルスケール 0-1）
+        steps: PGDのステップ数
         device: デバイス
     
     Returns:
@@ -180,22 +262,31 @@ def fgsm_attack(model, x, y, epsilon, device):
     """
     x = x.clone().detach().to(device)
     y = y.clone().detach().to(device)
-    x.requires_grad = True
     
-    # Forward pass
-    outputs = model(x)
-    loss = F.cross_entropy(outputs, y)
+    # ランダム初期化
+    delta = torch.zeros_like(x).uniform_(-epsilon, epsilon)
+    delta = torch.clamp(x + delta, 0.0, 1.0) - x
+    delta.requires_grad = True
     
-    # Backward pass
-    model.zero_grad()
-    loss.backward()
-    grad = x.grad.data
+    for step in range(steps):
+        x_adv = x + delta
+        
+        # Forward pass
+        outputs = model(x_adv)
+        loss = F.cross_entropy(outputs, y)
+        
+        # Backward pass
+        model.zero_grad()
+        loss.backward()
+        grad = delta.grad.data
+        
+        # PGD step
+        delta.data = delta.data + alpha * grad.sign()
+        delta.data = torch.clamp(delta.data, -epsilon, epsilon)
+        delta.data = torch.clamp(x + delta.data, 0.0, 1.0) - x
+        delta.grad.zero_()
     
-    # FGSM: x_adv = x + epsilon * sign(grad)
-    x_adv = x + epsilon * grad.sign()
-    
-    # クリッピング [0, 1]
-    x_adv = torch.clamp(x_adv, 0.0, 1.0).detach()
+    x_adv = torch.clamp(x + delta.detach(), 0.0, 1.0)
     
     return x_adv
 
@@ -216,7 +307,6 @@ def load_cached_samples(cached_path, device):
 # ========== モデル読み込み ==========
 def load_classifier(args, device):
     """分類器を読み込み"""
-    # 分類器（2クラス: NORMAL, PNEUMONIA）
     classifier = models.resnet50(weights=None)
     classifier.fc = nn.Linear(classifier.fc.in_features, 2)
     ckpt = torch.load(args.clf_ckpt, map_location=device)
@@ -225,14 +315,61 @@ def load_classifier(args, device):
     else:
         classifier.load_state_dict(ckpt)
     classifier = classifier.to(device).eval()
-    
     print(f"Loaded classifier from {args.clf_ckpt}")
-    
     return classifier
 
 
+def load_guided_diffusion(args, device):
+    """Guided-Diffusionモデルを読み込み"""
+    print("\nLoading Guided-Diffusion model (ImageNet pretrained)...")
+    
+    # 256x256 ImageNet unconditionalモデルの設定
+    model_config = {
+        'attention_resolutions': '32,16,8',
+        'class_cond': False,
+        'diffusion_steps': 1000,
+        'image_size': 256,
+        'learn_sigma': True,
+        'noise_schedule': 'linear',
+        'num_channels': 256,
+        'num_head_channels': 64,
+        'num_res_blocks': 2,
+        'resblock_updown': True,
+        'use_fp16': False,
+        'use_scale_shift_norm': True,
+    }
+    
+    # モデルと拡散プロセスを作成
+    diffusion_model, diffusion = create_model_and_diffusion(
+        **model_config,
+        timestep_respacing='',
+        use_kl=False,
+        predict_xstart=False,
+        rescale_timesteps=False,
+        rescale_learned_sigmas=False,
+        use_checkpoint=False,
+        use_new_attention_order=False,
+        dropout=0.0,
+        channel_mult='',
+        num_heads=4,
+        num_heads_upsample=-1,
+    )
+    
+    # チェックポイントのロード
+    state_dict = torch.load(args.diffusion_ckpt, map_location=device)
+    diffusion_model.load_state_dict(state_dict)
+    diffusion_model.to(device)
+    diffusion_model.eval()
+    
+    print(f"Loaded Guided-Diffusion model from {args.diffusion_ckpt}")
+    print(f"Model image size: 256x256")
+    print(f"Diffusion steps: {diffusion.num_timesteps}")
+    
+    return diffusion_model, diffusion
+
+
 # ========== 精度計算 ==========
-def get_accuracy(model, x, y, bs=32, device=None):
+def get_accuracy(model, x, y, bs=8, device=None):
     """モデルの精度を計算"""
     if device is None:
         device = next(model.parameters()).device
@@ -241,7 +378,7 @@ def get_accuracy(model, x, y, bs=32, device=None):
     correct = 0
     
     with torch.no_grad():
-        for i in range(n_batches):
+        for i in tqdm(range(n_batches), desc="Evaluating", leave=False):
             start_idx = i * bs
             end_idx = min((i + 1) * bs, len(x))
             x_batch = x[start_idx:end_idx].to(device)
@@ -254,7 +391,7 @@ def get_accuracy(model, x, y, bs=32, device=None):
 
 
 # ========== 予測取得 ==========
-def get_predictions(model, x, bs=32, device=None):
+def get_predictions(model, x, bs=8, device=None):
     """モデルの予測を取得"""
     if device is None:
         device = next(model.parameters()).device
@@ -263,7 +400,7 @@ def get_predictions(model, x, bs=32, device=None):
     preds = []
     
     with torch.no_grad():
-        for i in range(n_batches):
+        for i in tqdm(range(n_batches), desc="Predicting", leave=False):
             start_idx = i * bs
             end_idx = min((i + 1) * bs, len(x))
             x_batch = x[start_idx:end_idx].to(device)
@@ -296,21 +433,21 @@ def print_confusion_matrix(y_true, y_pred, title, classes=None):
     return {}
 
 
-# ========== FGSM攻撃実行 ==========
-def run_fgsm_attack(model, x_test, y_test, epsilon, device, batch_size=32):
-    """FGSM攻撃を実行して敵対的サンプルを生成"""
-    print(f"\nRunning FGSM attack with epsilon={epsilon:.4f}...")
+# ========== PGD攻撃実行 ==========
+def run_pgd_attack(model, x_test, y_test, epsilon, alpha, steps, device, batch_size=8):
+    """PGD攻撃を実行して敵対的サンプルを生成"""
+    print(f"\nRunning PGD attack with epsilon={epsilon:.4f}, alpha={alpha:.4f}, steps={steps}...")
     
     n_batches = (len(x_test) + batch_size - 1) // batch_size
     x_adv_list = []
     
-    for i in tqdm(range(n_batches), desc="FGSM Attack"):
+    for i in tqdm(range(n_batches), desc="PGD Attack"):
         start_idx = i * batch_size
         end_idx = min((i + 1) * batch_size, len(x_test))
         x_batch = x_test[start_idx:end_idx].to(device)
         y_batch = y_test[start_idx:end_idx].to(device)
         
-        x_adv_batch = fgsm_attack(model, x_batch, y_batch, epsilon, device)
+        x_adv_batch = pgd_attack(model, x_batch, y_batch, epsilon, alpha, steps, device)
         x_adv_list.append(x_adv_batch.cpu())
     
     x_adv = torch.cat(x_adv_list, dim=0)
@@ -319,26 +456,8 @@ def run_fgsm_attack(model, x_test, y_test, epsilon, device, batch_size=32):
     return x_adv
 
 
-# ========== JPEG圧縮適用 ==========
-def apply_jpeg_compression(x, jpeg_defense, batch_size=32, device=None):
-    """JPEG圧縮を適用"""
-    n_batches = (len(x) + batch_size - 1) // batch_size
-    x_compressed_list = []
-    
-    for i in tqdm(range(n_batches), desc="JPEG Compression"):
-        start_idx = i * batch_size
-        end_idx = min((i + 1) * batch_size, len(x))
-        x_batch = x[start_idx:end_idx]
-        if device:
-            x_batch = x_batch.to(device)
-        x_compressed_batch = jpeg_defense(x_batch)
-        x_compressed_list.append(x_compressed_batch.cpu())
-    
-    return torch.cat(x_compressed_list, dim=0)
-
-
 # ========== サンプル画像保存 ==========
-def save_sample_images(x_clean, x_adv, x_compressed_clean, x_compressed_adv, 
+def save_sample_images(x_clean, x_adv, x_purified_clean, x_purified_adv, 
                        y_true, classes, save_dir, max_samples=10):
     """サンプル画像を保存"""
     os.makedirs(save_dir, exist_ok=True)
@@ -348,18 +467,18 @@ def save_sample_images(x_clean, x_adv, x_compressed_clean, x_compressed_adv,
         label = int(y_true[i])
         label_name = classes[label] if classes else str(label)
         
-        # 4枚を並べて保存: Clean, Clean+JPEG, Adv, Adv+JPEG
+        # 4枚を並べて保存: Clean, Clean+Diffusion, Adv, Adv+Diffusion
         quad = torch.cat([
             x_clean[i:i+1],
-            x_compressed_clean[i:i+1],
+            x_purified_clean[i:i+1],
             x_adv[i:i+1],
-            x_compressed_adv[i:i+1]
+            x_purified_adv[i:i+1]
         ], dim=0)
         grid = make_grid(quad, nrow=4, padding=5, pad_value=1.0)
         save_image(grid, os.path.join(save_dir, f"{i:04d}_{label_name}.png"))
     
     print(f"Saved {n} sample images to {save_dir}")
-    print(f"  Format: [Clean | Clean+JPEG | Adversarial | Adv+JPEG]")
+    print(f"  Format: [Clean | Clean+Diffusion | Adversarial | Adv+Diffusion]")
 
 
 # ========== メイン ==========
@@ -378,19 +497,25 @@ def main():
     
     # 出力ディレクトリ
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join(args.output_dir, f"fgsm_eps{args.epsilon:.4f}_q{args.quality}_{timestamp}")
+    log_dir = os.path.join(args.output_dir, f"pgd_eps{args.epsilon:.4f}_s{args.steps}_{timestamp}")
     os.makedirs(log_dir, exist_ok=True)
     print(f"Output directory: {log_dir}")
     
     # モデル読み込み
     classifier = load_classifier(args, device)
+    diffusion_model, diffusion = load_guided_diffusion(args, device)
     
-    # JPEG防御
-    jpeg_defense = JPEGDefense(quality=args.quality)
+    # 浄化器
+    purifier = GuidedDiffusionPurifier(
+        diffusion_model, diffusion, device,
+        start_t=args.start_t,
+        T_purify=args.T_purify,
+        eta=args.eta
+    )
     
     # ラッパー作成
-    classifier_model = ClassifierWrapper(classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
-    defense_model = JPEGDefenseWrapper(jpeg_defense, classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
+    classifier_model = ClassifierWrapper(classifier, IMAGENET_MEAN, IMAGENET_STD, input_size=224).to(device).eval()
+    defense_model = DiffusionDefenseWrapper(purifier, classifier, IMAGENET_MEAN, IMAGENET_STD, input_size=224).to(device).eval()
     
     # クラス名
     test_dir = os.path.join(args.data_dir, 'test')
@@ -402,10 +527,12 @@ def main():
     
     # ==================== 評価開始 ====================
     print(f"\n{'='*70}")
-    print("FGSM Attack + JPEG Compression Defense Evaluation")
+    print("PGD Attack + Guided-Diffusion (ImageNet) Defense Evaluation")
     print(f"{'='*70}")
     print(f"Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
-    print(f"JPEG Quality: {args.quality}")
+    print(f"Alpha: {args.alpha:.4f} ({args.alpha*255:.1f}/255)")
+    print(f"Steps: {args.steps}")
+    print(f"Diffusion: start_t={args.start_t}, T_purify={args.T_purify}")
     print(f"Samples: {len(x_test)}")
     print(f"{'='*70}")
     
@@ -417,16 +544,16 @@ def main():
     print(f"Clean accuracy (classifier): {clean_acc:.4f}")
     results['clean_acc_classifier'] = clean_acc
     
-    # ========== 2. クリーン画像をJPEG圧縮した後の精度 ==========
-    print("\n[2/4] Evaluating clean images with JPEG compression...")
-    clean_compressed_acc = get_accuracy(defense_model, x_test, y_test, bs=args.batch_size, device=device)
-    print(f"Clean accuracy (with JPEG): {clean_compressed_acc:.4f}")
-    results['clean_acc_with_jpeg'] = clean_compressed_acc
+    # ========== 2. クリーン画像を浄化した後の精度 ==========
+    print("\n[2/4] Evaluating clean images with Guided-Diffusion purification...")
+    clean_purified_acc = get_accuracy(defense_model, x_test, y_test, bs=args.batch_size, device=device)
+    print(f"Clean accuracy (with Diffusion): {clean_purified_acc:.4f}")
+    results['clean_acc_with_diffusion'] = clean_purified_acc
     
-    # ========== 3. FGSM攻撃 & 敵対的画像の精度（防御なし） ==========
-    print("\n[3/4] Running FGSM attack and evaluating adversarial images...")
+    # ========== 3. PGD攻撃 & 敵対的画像の精度（防御なし） ==========
+    print("\n[3/4] Running PGD attack and evaluating adversarial images...")
     start_time = time.time()
-    x_adv = run_fgsm_attack(classifier_model, x_test, y_test, args.epsilon, device, args.batch_size)
+    x_adv = run_pgd_attack(classifier_model, x_test, y_test, args.epsilon, args.alpha, args.steps, device, args.batch_size)
     attack_time = time.time() - start_time
     
     adv_acc_no_defense = get_accuracy(classifier_model, x_adv, y_test, bs=args.batch_size, device=device)
@@ -434,11 +561,11 @@ def main():
     results['adv_acc_no_defense'] = adv_acc_no_defense
     results['attack_time'] = attack_time
     
-    # ========== 4. 敵対的画像をJPEG圧縮した後の精度（防御あり） ==========
-    print("\n[4/4] Evaluating adversarial images with JPEG compression...")
+    # ========== 4. 敵対的画像を浄化した後の精度（防御あり） ==========
+    print("\n[4/4] Evaluating adversarial images with Guided-Diffusion purification...")
     adv_defended_acc = get_accuracy(defense_model, x_adv, y_test, bs=args.batch_size, device=device)
-    print(f"Adversarial accuracy (with JPEG): {adv_defended_acc:.4f}")
-    results['adv_acc_with_jpeg'] = adv_defended_acc
+    print(f"Adversarial accuracy (with Diffusion): {adv_defended_acc:.4f}")
+    results['adv_acc_with_diffusion'] = adv_defended_acc
     
     # 防御効果
     defense_improvement = adv_defended_acc - adv_acc_no_defense
@@ -448,16 +575,17 @@ def main():
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
-    print(f"Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
-    print(f"Defense: JPEG Compression, Quality: {args.quality}")
+    print(f"Attack: PGD, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
+    print(f"        Alpha: {args.alpha:.4f} ({args.alpha*255:.1f}/255), Steps: {args.steps}")
+    print(f"Defense: Guided-Diffusion (ImageNet), start_t={args.start_t}, T_purify={args.T_purify}")
     print(f"-"*70)
     print(f"Clean Accuracy:")
     print(f"  Classifier only:          {results['clean_acc_classifier']:.4f}")
-    print(f"  With JPEG compression:    {results['clean_acc_with_jpeg']:.4f}")
+    print(f"  With Diffusion:           {results['clean_acc_with_diffusion']:.4f}")
     print(f"-"*70)
-    print(f"Adversarial Accuracy (FGSM):")
+    print(f"Adversarial Accuracy (PGD):")
     print(f"  Without defense:          {results['adv_acc_no_defense']:.4f}")
-    print(f"  With JPEG compression:    {results['adv_acc_with_jpeg']:.4f}")
+    print(f"  With Diffusion:           {results['adv_acc_with_diffusion']:.4f}")
     print(f"  Defense improvement:      {results['defense_improvement']:+.4f}")
     print(f"-"*70)
     print(f"Attack time: {results['attack_time']:.2f}s")
@@ -470,35 +598,43 @@ def main():
     
     # 予測取得
     pred_clean = get_predictions(classifier_model, x_test, bs=args.batch_size, device=device)
-    pred_clean_compressed = get_predictions(defense_model, x_test, bs=args.batch_size, device=device)
+    pred_clean_purified = get_predictions(defense_model, x_test, bs=args.batch_size, device=device)
     pred_adv_no_def = get_predictions(classifier_model, x_adv, bs=args.batch_size, device=device)
     pred_adv_defended = get_predictions(defense_model, x_adv, bs=args.batch_size, device=device)
     
     y_true = y_test.cpu().numpy()
     
     cm_clean = print_confusion_matrix(y_true, pred_clean, "1. Clean Images (Classifier only)", classes)
-    cm_clean_compressed = print_confusion_matrix(y_true, pred_clean_compressed, "2. Clean Images (with JPEG)", classes)
+    cm_clean_purified = print_confusion_matrix(y_true, pred_clean_purified, "2. Clean Images (with Diffusion)", classes)
     cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "3. Adversarial Images (No Defense)", classes)
-    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "4. Adversarial Images (with JPEG)", classes)
+    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "4. Adversarial Images (with Diffusion)", classes)
     
     results['confusion_matrices'] = {
         'clean': cm_clean,
-        'clean_compressed': cm_clean_compressed,
+        'clean_purified': cm_clean_purified,
         'adv_no_defense': cm_adv_no_def,
         'adv_defended': cm_adv_defended
     }
     
-    # ==================== 圧縮画像を生成して保存 ====================
-    print("\nGenerating compressed samples for visualization...")
+    # ==================== 浄化画像を生成して保存 ====================
+    print("\nGenerating purified samples for visualization...")
     n_samples = min(10, len(x_test))
-    x_compressed_clean = apply_jpeg_compression(x_test[:n_samples], jpeg_defense, batch_size=n_samples)
-    x_compressed_adv = apply_jpeg_compression(x_adv[:n_samples], jpeg_defense, batch_size=n_samples)
+    x_purified_clean = []
+    x_purified_adv = []
+    
+    with torch.no_grad():
+        for i in tqdm(range(n_samples), desc="Generating samples"):
+            x_purified_clean.append(purifier(x_test[i:i+1].to(device)).cpu())
+            x_purified_adv.append(purifier(x_adv[i:i+1].to(device)).cpu())
+    
+    x_purified_clean = torch.cat(x_purified_clean, dim=0)
+    x_purified_adv = torch.cat(x_purified_adv, dim=0)
     
     save_sample_images(
         x_test[:n_samples].cpu(), 
         x_adv[:n_samples].cpu(),
-        x_compressed_clean,
-        x_compressed_adv,
+        x_purified_clean,
+        x_purified_adv,
         y_test[:n_samples].cpu().numpy(), 
         classes,
         os.path.join(log_dir, 'samples')
@@ -510,7 +646,8 @@ def main():
         'x_adv': x_adv.cpu(),
         'y': y_test.cpu(),
         'epsilon': args.epsilon,
-        'jpeg_quality': args.quality,
+        'alpha': args.alpha,
+        'steps': args.steps,
     }, os.path.join(log_dir, 'adversarial_samples.pt'))
     print(f"Saved adversarial samples to: {os.path.join(log_dir, 'adversarial_samples.pt')}")
     
@@ -518,11 +655,14 @@ def main():
     summary_path = os.path.join(log_dir, 'summary.txt')
     with open(summary_path, 'w') as f:
         f.write("="*70 + "\n")
-        f.write("ChestX-ray - FGSM Attack + JPEG Compression Defense\n")
+        f.write("ChestX-ray - PGD Attack + Guided-Diffusion (ImageNet) Defense\n")
         f.write("="*70 + "\n\n")
-        f.write(f"Attack: FGSM\n")
+        f.write(f"Attack: PGD\n")
         f.write(f"Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)\n")
-        f.write(f"Defense: JPEG Compression, Quality: {args.quality}\n")
+        f.write(f"Alpha: {args.alpha:.4f} ({args.alpha*255:.1f}/255)\n")
+        f.write(f"Steps: {args.steps}\n")
+        f.write(f"Defense: Guided-Diffusion (ImageNet), start_t={args.start_t}, T_purify={args.T_purify}\n")
+        f.write(f"Diffusion Model: {args.diffusion_ckpt}\n")
         f.write(f"Samples: {len(x_test)}\n\n")
         
         f.write("-"*70 + "\n")
@@ -531,11 +671,11 @@ def main():
         
         f.write("Clean Accuracy:\n")
         f.write(f"  Classifier only:          {results['clean_acc_classifier']:.4f}\n")
-        f.write(f"  With JPEG compression:    {results['clean_acc_with_jpeg']:.4f}\n\n")
+        f.write(f"  With Diffusion:           {results['clean_acc_with_diffusion']:.4f}\n\n")
         
-        f.write("Adversarial Accuracy (FGSM):\n")
+        f.write("Adversarial Accuracy (PGD):\n")
         f.write(f"  Without defense:          {results['adv_acc_no_defense']:.4f}\n")
-        f.write(f"  With JPEG compression:    {results['adv_acc_with_jpeg']:.4f}\n")
+        f.write(f"  With Diffusion:           {results['adv_acc_with_diffusion']:.4f}\n")
         f.write(f"  Defense improvement:      {results['defense_improvement']:+.4f}\n\n")
         
         f.write(f"Attack time: {results['attack_time']:.2f}s\n\n")
@@ -545,9 +685,9 @@ def main():
         f.write("-"*70 + "\n\n")
         
         for name, cm in [("Clean (Classifier)", cm_clean), 
-                         ("Clean (with JPEG)", cm_clean_compressed),
+                         ("Clean (with Diffusion)", cm_clean_purified),
                          ("Adversarial (No Defense)", cm_adv_no_def),
-                         ("Adversarial (with JPEG)", cm_adv_defended)]:
+                         ("Adversarial (with Diffusion)", cm_adv_defended)]:
             if cm:
                 f.write(f"{name}:\n")
                 f.write(f"  TN: {cm['tn']:4d}  FP: {cm['fp']:4d}\n")
@@ -559,9 +699,9 @@ def main():
     results_json = {
         'args': vars(args),
         'clean_acc_classifier': results['clean_acc_classifier'],
-        'clean_acc_with_jpeg': results['clean_acc_with_jpeg'],
+        'clean_acc_with_diffusion': results['clean_acc_with_diffusion'],
         'adv_acc_no_defense': results['adv_acc_no_defense'],
-        'adv_acc_with_jpeg': results['adv_acc_with_jpeg'],
+        'adv_acc_with_diffusion': results['adv_acc_with_diffusion'],
         'defense_improvement': results['defense_improvement'],
         'attack_time': results['attack_time'],
     }
