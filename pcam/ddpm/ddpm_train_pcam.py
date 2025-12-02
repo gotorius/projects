@@ -292,23 +292,31 @@ class GaussianDiffusion:
 # ========== グラフ描画 ==========
 def plot_losses(all_losses, epoch_losses, save_dir):
     """訓練ロスのグラフを描画"""
+    # Filter out NaN/Inf values
+    all_losses_clean = [x for x in all_losses if not (math.isnan(x) or math.isinf(x))]
+    epoch_losses_clean = [x for x in epoch_losses if not (math.isnan(x) or math.isinf(x))]
+    
+    if not all_losses_clean or not epoch_losses_clean:
+        print('Warning: No valid loss values to plot')
+        return
+    
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     
     # Iteration loss
-    axes[0].plot(all_losses, 'b-', alpha=0.5, linewidth=0.5)
-    window = min(100, len(all_losses) // 10 + 1)
-    if len(all_losses) > window:
-        moving_avg = np.convolve(all_losses, np.ones(window)/window, mode='valid')
-        axes[0].plot(range(window-1, len(all_losses)), moving_avg, 'r-', linewidth=2)
+    axes[0].plot(all_losses_clean, 'b-', alpha=0.5, linewidth=0.5)
+    window = min(100, len(all_losses_clean) // 10 + 1)
+    if len(all_losses_clean) > window:
+        moving_avg = np.convolve(all_losses_clean, np.ones(window)/window, mode='valid')
+        axes[0].plot(range(window-1, len(all_losses_clean)), moving_avg, 'r-', linewidth=2)
     axes[0].set_xlabel('Iteration')
     axes[0].set_ylabel('Loss')
     axes[0].set_title('Training Loss (per iteration)')
     axes[0].grid(True, alpha=0.3)
     
     # Epoch loss
-    axes[1].plot(range(1, len(epoch_losses)+1), epoch_losses, 'bo-', linewidth=2, markersize=4)
-    min_loss = min(epoch_losses)
-    min_epoch = epoch_losses.index(min_loss) + 1
+    axes[1].plot(range(1, len(epoch_losses_clean)+1), epoch_losses_clean, 'bo-', linewidth=2, markersize=4)
+    min_loss = min(epoch_losses_clean)
+    min_epoch = epoch_losses_clean.index(min_loss) + 1
     axes[1].axhline(y=min_loss, color='r', linestyle='--', alpha=0.5)
     axes[1].scatter([min_epoch], [min_loss], color='red', s=100, zorder=5)
     axes[1].set_xlabel('Epoch')
@@ -317,7 +325,7 @@ def plot_losses(all_losses, epoch_losses, save_dir):
     axes[1].grid(True, alpha=0.3)
     
     # Log scale
-    axes[2].semilogy(range(1, len(epoch_losses)+1), epoch_losses, 'go-', linewidth=2, markersize=4)
+    axes[2].semilogy(range(1, len(epoch_losses_clean)+1), epoch_losses_clean, 'go-', linewidth=2, markersize=4)
     axes[2].set_xlabel('Epoch')
     axes[2].set_ylabel('Loss (log scale)')
     axes[2].set_title('Epoch Loss (Log Scale)')
@@ -360,6 +368,18 @@ def train(args):
     print(f'Classes: {dataset.classes}')
     print(f'Total samples: {len(dataset)}')
     
+    # Debug: Check first batch for data issues
+    print('\nChecking first batch for data integrity...')
+    test_loader = DataLoader(dataset, batch_size=4, shuffle=False)
+    test_images, _ = next(iter(test_loader))
+    print(f'  Image shape: {test_images.shape}')
+    print(f'  Min value: {test_images.min().item():.4f}')
+    print(f'  Max value: {test_images.max().item():.4f}')
+    print(f'  Mean value: {test_images.mean().item():.4f}')
+    print(f'  Has NaN: {torch.isnan(test_images).any().item()}')
+    print(f'  Has Inf: {torch.isinf(test_images).any().item()}')
+    del test_loader, test_images
+    
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -379,8 +399,8 @@ def train(args):
     diffusion = GaussianDiffusion(timesteps=args.timesteps, device=device)
     
     # Optimizer & Scaler (AMP)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
     
     # EMA
     ema = EMA(model, decay=0.9995)
@@ -411,6 +431,7 @@ def train(args):
     for epoch in range(start_epoch, args.epochs):
         model.train()
         running_loss = 0.0
+        num_valid_batches = 0
         
         pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{args.epochs}')
         for batch_idx, (images, _) in enumerate(pbar):
@@ -418,11 +439,26 @@ def train(args):
             
             optimizer.zero_grad()
             
+            # Check for NaN in input
+            if torch.isnan(images).any() or torch.isinf(images).any():
+                print(f'Warning: NaN/Inf detected in input batch {batch_idx}, skipping...')
+                continue
+            
             # Mixed precision training
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
                 loss = diffusion.training_loss(model, images)
             
+            # Check for NaN loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f'Warning: NaN/Inf loss at batch {batch_idx}, skipping...')
+                continue
+            
             scaler.scale(loss).backward()
+            
+            # Gradient clipping to prevent explosion
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             scaler.step(optimizer)
             scaler.update()
             
@@ -432,15 +468,25 @@ def train(args):
             loss_val = loss.item()
             all_losses.append(loss_val)
             running_loss += loss_val
+            num_valid_batches += 1
             
             pbar.set_postfix({'loss': f'{loss_val:.4f}'})
         
-        avg_loss = running_loss / len(dataloader)
-        epoch_losses.append(avg_loss)
-        print(f'Epoch {epoch+1} | Avg Loss: {avg_loss:.6f}')
+        # Calculate average loss (handle case when all batches were skipped)
+        if num_valid_batches > 0:
+            avg_loss = running_loss / num_valid_batches
+        else:
+            avg_loss = float('inf')
+            print('Warning: All batches had NaN/Inf loss this epoch!')
         
-        # Early stopping check
-        if avg_loss < best_loss:
+        epoch_losses.append(avg_loss)
+        print(f'Epoch {epoch+1} | Avg Loss: {avg_loss:.6f} | Valid batches: {num_valid_batches}/{len(dataloader)}')
+        
+        # Early stopping check (skip if loss is NaN/Inf)
+        if math.isnan(avg_loss) or math.isinf(avg_loss):
+            patience_counter += 1
+            print(f'No improvement (NaN/Inf loss) for {patience_counter}/{args.patience} epochs')
+        elif avg_loss < best_loss:
             best_loss = avg_loss
             patience_counter = 0
             
@@ -504,10 +550,16 @@ def train(args):
     plot_losses(all_losses, epoch_losses, args.save_dir)
     
     # Final: Load best model and generate samples
-    print('\nGenerating final samples with best model...')
-    best_ckpt = torch.load(os.path.join(args.save_dir, 'best_model.pth'), map_location=device)
-    model.load_state_dict(best_ckpt['model_state_dict'])
-    model.eval()
+    best_model_path = os.path.join(args.save_dir, 'best_model.pth')
+    if os.path.exists(best_model_path):
+        print('\nGenerating final samples with best model...')
+        best_ckpt = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(best_ckpt['model_state_dict'])
+        model.eval()
+    else:
+        print('\nWarning: best_model.pth not found. Using current model for final samples...')
+        ema.apply(model)
+        model.eval()
     
     for i in range(3):
         samples = diffusion.p_sample_loop(model, (16, 3, args.image_size, args.image_size))
