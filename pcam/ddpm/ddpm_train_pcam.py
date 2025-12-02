@@ -32,7 +32,7 @@ def get_args():
                         default='/mnt/data1/gotou/projects/pcam/ddpm/checkpoints',
                         help='モデル保存先')
     parser.add_argument('--image_size', type=int, default=224, help='画像サイズ')
-    parser.add_argument('--batch_size', type=int, default=16, help='バッチサイズ')
+    parser.add_argument('--batch_size', type=int, default=8, help='バッチサイズ')
     parser.add_argument('--epochs', type=int, default=100, help='エポック数')
     parser.add_argument('--lr', type=float, default=2e-4, help='学習率')
     parser.add_argument('--timesteps', type=int, default=1000, help='拡散ステップ数')
