@@ -71,7 +71,7 @@ def parse_args():
                         default='/mnt/data1/gotou/projects/chestxray/correct_samples_500.pt',
                         help='Path to cached samples')
     parser.add_argument('--gan_ckpt', type=str,
-                        default='/mnt/data1/gotou/projects/chestxray/gan/checkpoints/best_model.pth',
+                        default='/mnt/data1/gotou/projects/chestxray/gan/checkpoints/20251205_033202/best_model.pth',
                         help='Defense-GAN checkpoint path')
     parser.add_argument('--clf_ckpt', type=str,
                         default='/mnt/data1/gotou/projects/chestxray/resnet/resnet50_best.pth',
@@ -299,8 +299,8 @@ def load_models(args, device):
 def load_cached_samples(path, device):
     """キャッシュされたサンプルを読み込み"""
     data = torch.load(path, map_location='cpu')
-    x_test = data['images']
-    y_test = data['labels']
+    x_test = data['x_test']
+    y_test = data['y_test']
     print(f"Loaded {len(x_test)} cached samples from {path}")
     return x_test, y_test
 
