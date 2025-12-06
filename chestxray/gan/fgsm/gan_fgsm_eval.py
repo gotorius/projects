@@ -53,18 +53,20 @@ def parse_args():
     # Defense-GAN設定
     parser.add_argument('--z_dim', type=int, default=128,
                         help='Latent dimension')
-    parser.add_argument('--n_iter', type=int, default=200,
+    parser.add_argument('--n_iter', type=int, default=500,
                         help='Number of optimization iterations for z')
-    parser.add_argument('--n_restarts', type=int, default=10,
+    parser.add_argument('--n_restarts', type=int, default=20,
                         help='Number of random restarts')
-    parser.add_argument('--lr_z', type=float, default=0.01,
+    parser.add_argument('--lr_z', type=float, default=0.1,
                         help='Learning rate for z optimization')
     
     # 実行設定
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=128,
                         help='Batch size for evaluation')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--num_samples', type=int, default=None,
+                        help='Number of samples to use (None = all)')
     
     # パス設定
     parser.add_argument('--cached_samples', type=str,
@@ -164,10 +166,11 @@ class DefenseGANPurifier(nn.Module):
         """[-1,1] → [0,1]"""
         return torch.clamp((x + 1.0) / 2.0, 0, 1)
     
-    def find_best_z(self, x_gray):
+    def find_best_z(self, x_gray, debug=False):
         """
         入力画像に最も近い潜在ベクトルを最適化で探索
         x_gray: グレースケール画像 [0,1], shape (B, 1, H, W)
+        debug: デバッグ出力を行うかどうか
         """
         batch_size = x_gray.size(0)
         x_target = self.pixel_to_gan(x_gray)  # [-1, 1]
@@ -196,6 +199,9 @@ class DefenseGANPurifier(nn.Module):
                 final_loss = F.mse_loss(x_recon, x_target, reduction='none')
                 final_loss = final_loss.view(batch_size, -1).mean(dim=1)
                 
+                if debug and restart == 0:
+                    print(f"[PURIFIER] Restart {restart}: loss={final_loss[0].item():.6f}")
+                
                 for b in range(batch_size):
                     if final_loss[b] < best_loss[b]:
                         best_loss[b] = final_loss[b]
@@ -204,9 +210,12 @@ class DefenseGANPurifier(nn.Module):
                         else:
                             best_z[b] = z[b].clone()
         
+        if debug:
+            print(f"[PURIFIER] Best loss after all restarts: {best_loss[0].item():.6f}")
+        
         return best_z
     
-    def forward(self, x_rgb):
+    def forward(self, x_rgb, debug=False):
         """
         RGB画像 [0,1] を浄化
         x_rgb: (B, 3, H, W), [0, 1]
@@ -215,17 +224,28 @@ class DefenseGANPurifier(nn.Module):
         # RGB → グレースケール
         x_gray = self.rgb_to_gray(x_rgb)
         
+        if debug:
+            print(f"[PURIFIER] Input (RGB) shape: {x_rgb.shape}, gray shape: {x_gray.shape}")
+            print(f"[PURIFIER] Input RGB stats: min={x_rgb.min():.4f}, max={x_rgb.max():.4f}, mean={x_rgb.mean():.4f}")
+            print(f"[PURIFIER] Input gray stats: min={x_gray.min():.4f}, max={x_gray.max():.4f}, mean={x_gray.mean():.4f}")
+        
         # 最適な潜在ベクトルを探索
         self.generator.eval()
-        best_z = self.find_best_z(x_gray)
+        best_z = self.find_best_z(x_gray, debug=debug)
         
         # 再構成
         with torch.no_grad():
             x_recon = self.generator(best_z)
         
+        if debug:
+            print(f"[PURIFIER] Generator output stats: min={x_recon.min():.4f}, max={x_recon.max():.4f}, mean={x_recon.mean():.4f}")
+        
         # [-1,1] → [0,1] → RGB
         x_recon_pixel = self.gan_to_pixel(x_recon)
         x_rgb_out = self.gray_to_rgb(x_recon_pixel)
+        
+        if debug:
+            print(f"[PURIFIER] Final output stats: min={x_rgb_out.min():.4f}, max={x_rgb_out.max():.4f}, mean={x_rgb_out.mean():.4f}")
         
         return x_rgb_out
 
@@ -358,26 +378,33 @@ def get_predictions(model, x_test, bs=32, device='cuda'):
 
 def print_confusion_matrix(y_true, y_pred, title, classes):
     """混同行列を表示"""
-    cm = confusion_matrix(y_true, y_pred)
+    # 両クラスのラベルを指定して正しい形状の混同行列を取得
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     print(f"\n{title}")
     print("-" * 50)
     print(f"{'':>15} {'Pred ' + classes[0]:>15} {'Pred ' + classes[1]:>15}")
     print(f"{'True ' + classes[0]:>15} {cm[0,0]:>15} {cm[0,1]:>15}")
     print(f"{'True ' + classes[1]:>15} {cm[1,0]:>15} {cm[1,1]:>15}")
     
-    tn, fp, fn, tp = cm.ravel()
-    accuracy = (tp + tn) / (tp + tn + fp + fn)
+    # cm.ravel()が4要素でない場合に対応
+    if cm.size == 4:
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        tn = fp = fn = tp = 0
+        
+    total = tn + fp + fn + tp
+    accuracy = (tp + tn) / total if total > 0 else 0
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
     
     print(f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
-    return {'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp,
+    return {'tn': int(tn), 'fp': int(fp), 'fn': int(fn), 'tp': int(tp),
             'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1}
 
 
 # ========== 浄化評価（Defense-GANは遅いため別関数）==========
-def evaluate_with_purification(purifier, classifier_model, x_test, y_test, device, desc="Purifying"):
+def evaluate_with_purification(purifier, classifier_model, x_test, y_test, device, desc="Purifying", debug=False):
     """Defense-GANで浄化しながら評価"""
     purifier.eval()
     classifier_model.eval()
@@ -391,17 +418,33 @@ def evaluate_with_purification(purifier, classifier_model, x_test, y_test, devic
         x = x_test[i:i+1].to(device)
         y = y_test[i:i+1].to(device)
         
-        # 浄化
-        x_purified = purifier(x)
+        # デバッグ: 入力画像の統計
+        if debug and i == 0:
+            print(f"\n[DEBUG] Input image stats: min={x.min():.4f}, max={x.max():.4f}, mean={x.mean():.4f}")
+        
+        # 浄化（デバッグモードで詳細出力、最初の1つだけ）
+        x_purified = purifier(x, debug=debug and i == 0)
+        
+        # デバッグ: 浄化後の画像の統計
+        if debug and i == 0:
+            print(f"[DEBUG] Purified image stats: min={x_purified.min():.4f}, max={x_purified.max():.4f}, mean={x_purified.mean():.4f}")
         
         # 正規化して分類
         mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
         std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
         x_norm = (x_purified - mean) / std
         
+        if debug and i == 0:
+            print(f"[DEBUG] Normalized image stats: min={x_norm.min():.4f}, max={x_norm.max():.4f}, mean={x_norm.mean():.4f}")
+        
         with torch.no_grad():
             outputs = classifier_model.classifier(x_norm)
+            probs = F.softmax(outputs, dim=1)
             _, predicted = outputs.max(1)
+            
+            if debug and i < 3:
+                print(f"[DEBUG] Sample {i}: true={y.item()}, pred={predicted.item()}, probs={probs[0].cpu().numpy()}")
+            
             correct += (predicted == y).sum().item()
             total += 1
             predictions.append(predicted.cpu().numpy()[0])
@@ -475,12 +518,24 @@ def main():
     # データ読み込み
     x_test, y_test = load_cached_samples(args.cached_samples, device)
     
+    # サンプル数を制限
+    if args.num_samples is not None and args.num_samples < len(x_test):
+        x_test = x_test[:args.num_samples]
+        y_test = y_test[:args.num_samples]
+        print(f"Limited to {args.num_samples} samples for quick testing")
+    
+    # クラス分布を表示
+    unique, counts = torch.unique(y_test, return_counts=True)
+    print(f"Class distribution: {dict(zip(unique.tolist(), counts.tolist()))}")
+    print(f"  Class 0 ({classes[0]}): {(y_test == 0).sum().item()}")
+    print(f"  Class 1 ({classes[1]}): {(y_test == 1).sum().item()}")
+    
     # ==================== 評価開始 ====================
     print(f"\n{'='*70}")
     print("FGSM Attack + Defense-GAN Evaluation")
     print(f"{'='*70}")
     print(f"Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
-    print(f"Defense-GAN: n_iter={args.n_iter}, n_restarts={args.n_restarts}")
+    print(f"Defense-GAN: n_iter={args.n_iter}, n_restarts={args.n_restarts}, lr_z={args.lr_z}")
     print(f"Samples: {len(x_test)}")
     print(f"{'='*70}")
     
@@ -495,7 +550,7 @@ def main():
     # ========== 2. クリーン画像を浄化した後の精度 ==========
     print("\n[2/4] Evaluating clean images with Defense-GAN purification...")
     clean_purified_acc, pred_clean_purified = evaluate_with_purification(
-        purifier, classifier_model, x_test, y_test, device, desc="Purifying clean images"
+        purifier, classifier_model, x_test, y_test, device, desc="Purifying clean images", debug=True
     )
     print(f"Clean accuracy (with Defense-GAN): {clean_purified_acc:.4f}")
     results['clean_acc_with_defensegan'] = clean_purified_acc
