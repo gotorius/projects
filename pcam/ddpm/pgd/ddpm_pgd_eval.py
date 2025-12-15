@@ -93,7 +93,11 @@ def load_models(args, device):
     
     # 分類器
     classifier = models.resnet50(weights=None)
-    classifier.fc = nn.Linear(classifier.fc.in_features, num_classes)
+    num_features = classifier.fc.in_features
+    classifier.fc = nn.Sequential(
+        nn.Dropout(0.5),
+        nn.Linear(num_features, num_classes)
+    )
     checkpoint = torch.load(args.clf_ckpt, map_location=device)
     if 'model_state_dict' in checkpoint:
         classifier.load_state_dict(checkpoint['model_state_dict'])

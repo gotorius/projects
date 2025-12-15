@@ -40,7 +40,11 @@ def main():
     
     # 分類器
     classifier = models.resnet50(weights=None)
-    classifier.fc = nn.Linear(classifier.fc.in_features, len(dataset.classes))
+    num_features = classifier.fc.in_features
+    classifier.fc = nn.Sequential(
+        nn.Dropout(0.5),
+        nn.Linear(num_features, len(dataset.classes))
+    )
     
     checkpoint = torch.load(CLASSIFIER_PATH, map_location=device)
     if 'model_state_dict' in checkpoint:

@@ -1,14 +1,13 @@
 """
-DDPM-based Adversarial Defense Evaluation for PCam Dataset - FGSM Attack
+DDPM-based Adversarial Defense Evaluation for PCam Dataset - FGSM Attack (Improved)
 
-評価内容:
-1. クリーン画像の分類精度
-2. クリーン画像をDDPMで浄化した後の分類精度
-3. FGSM敵対的画像の分類精度(防御なし)
-4. FGSM敵対的画像をDDPMで浄化した後の分類精度(防御あり)
+改善点:
+1. x0再構成を使用してノイズを抑制
+2. 適切な正規化変換(ImageNet ⇔ DDPM)
+3. kaggleコードと同様の浄化アルゴリズム
 
 実行例:
-python ddpm_fgsm_eval.py --epsilon 0.031 --t_purify 50 --start_t 80
+python ddpm_fgsm_eval_improved.py --epsilon 0.031 --t_purify 50 --start_t 80
 """
 
 import os
@@ -35,7 +34,7 @@ from ddpm_train_pcam import SimpleUNet, GaussianDiffusion
 
 # ========== 引数パーサー ==========
 def parse_args():
-    parser = argparse.ArgumentParser(description='DDPM Defense Evaluation - FGSM Attack')
+    parser = argparse.ArgumentParser(description='DDPM Defense Evaluation - FGSM Attack (Improved)')
     
     # 攻撃設定
     parser.add_argument('--epsilon', type=float, default=8/255,
@@ -46,6 +45,8 @@ def parse_args():
                         help='Number of diffusion steps for purification')
     parser.add_argument('--start_t', type=int, default=80,
                         help='Starting timestep for reverse diffusion')
+    parser.add_argument('--eta', type=float, default=0.0,
+                        help='Stochasticity parameter for DDIM')
     
     # パス設定
     parser.add_argument('--cached_samples', type=str,
@@ -58,7 +59,7 @@ def parse_args():
                         default='/mnt/data1/gotou/projects/pcam/resnet/checkpoints/best_resnet50_pcam.pth',
                         help='Classifier checkpoint path')
     parser.add_argument('--output_dir', type=str,
-                        default='/mnt/data1/gotou/projects/pcam/ddpm/fgsm/results',
+                        default='/mnt/data1/gotou/projects/pcam/ddpm/fgsm/results_improved',
                         help='Output directory')
     
     # 実行設定
@@ -77,42 +78,84 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-# ========== DDPM Purifier ==========
-class DDPMPurifier(nn.Module):
-    """DDPM-based purification"""
-    def __init__(self, unet, diffusion, device, t_purify=50, start_t=80):
+# ========== DDPM Purifier (Improved) ==========
+class DDPMPurifierImproved(nn.Module):
+    """DDPM-based purification with x0 reconstruction"""
+    def __init__(self, unet, diffusion, device, t_purify=50, start_t=80, eta=0.0):
         super().__init__()
         self.unet = unet
         self.diffusion = diffusion
         self.device = device
         self.t_purify = t_purify
         self.start_t = start_t
+        self.eta = eta
+        
+        # 正規化用のテンソル
+        self.imagenet_mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+        self.imagenet_std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
+        self.ddpm_mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
+        self.ddpm_std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
     
     def forward(self, x):
         """
-        x: (B, 3, H, W), [0, 1]
+        x: (B, 3, H, W), [0, 1] (unnormalized pixel values)
         return: purified image (B, 3, H, W), [0, 1]
         """
         # [0,1] → [-1,1] (DDPM訓練時の正規化)
-        x = x * 2.0 - 1.0
+        x_minus1to1 = (x - self.ddpm_mean) / self.ddpm_std
         
         # Forward: ノイズを加える (start_t まで)
         batch_size = x.size(0)
-        t = torch.full((batch_size,), self.start_t, device=self.device, dtype=torch.long)
-        noise = torch.randn_like(x)
-        x_noisy = self.diffusion.q_sample(x, t, noise)
+        t0 = torch.full((batch_size,), self.start_t, device=self.device, dtype=torch.long)
+        noise = torch.randn_like(x_minus1to1)
+        
+        sqrt_alpha_bar_t0 = self.diffusion.sqrt_alphas_cumprod[t0].view(-1, 1, 1, 1)
+        sqrt_1m_alpha_bar_t0 = self.diffusion.sqrt_one_minus_alphas_cumprod[t0].view(-1, 1, 1, 1)
+        x_t = sqrt_alpha_bar_t0 * x_minus1to1 + sqrt_1m_alpha_bar_t0 * noise
         
         # Reverse: ノイズ除去 (start_t → start_t - t_purify)
-        x_purified = x_noisy
+        eps_pred_final = None
+        t_final = self.start_t
+        
         for i in range(self.t_purify):
             curr_t = self.start_t - i
             if curr_t < 0:
                 break
+            
             t_batch = torch.full((batch_size,), curr_t, device=self.device, dtype=torch.long)
-            x_purified = self.diffusion.p_sample(self.unet, x_purified, t_batch)
+            eps_pred = self.unet(x_t, t_batch)
+            
+            alpha_t = self.diffusion.alphas[curr_t]
+            alpha_bar_t = self.diffusion.alphas_cumprod[curr_t]
+            
+            # DDPMの平均計算
+            mean = (1.0 / torch.sqrt(alpha_t)) * (
+                x_t - (1 - alpha_t) / torch.sqrt(1 - alpha_bar_t) * eps_pred
+            )
+            
+            if curr_t > 0:
+                z = torch.randn_like(x_t)
+                sigma = self.eta * torch.sqrt(self.diffusion.posterior_variance[curr_t])
+                x_t = mean + sigma * z
+            else:
+                x_t = mean
+            
+            # 各ステップでクランプ
+            x_t = torch.clamp(x_t, -1.0, 1.0)
+            
+            # 最終ステップの記録
+            eps_pred_final = eps_pred
+            t_final = curr_t
+        
+        # x0再構成 (ノイズ抑制)
+        alpha_bar_tf = self.diffusion.alphas_cumprod[t_final]
+        x0_hat = (x_t - torch.sqrt(1 - alpha_bar_tf) * eps_pred_final) / torch.sqrt(alpha_bar_tf + 1e-12)
+        x0_hat = torch.clamp(x0_hat, -1.0, 1.0)
         
         # [-1,1] → [0,1]
-        x_purified = torch.clamp((x_purified + 1.0) / 2.0, 0, 1)
+        x_purified = x0_hat * self.ddpm_std + self.ddpm_mean
+        x_purified = torch.clamp(x_purified, 0, 1)
+        
         return x_purified
 
 
@@ -148,7 +191,16 @@ def load_models(args, device):
     image_size = ddpm_args.get('image_size', 224)
     
     unet = SimpleUNet(in_ch=3, base_ch=base_ch, time_emb_dim=256).to(device)
-    unet.load_state_dict(ddpm_ckpt['model_state_dict'])
+    
+    # EMAがあれば優先的に使用
+    if 'ema_state_dict' in ddpm_ckpt and ddpm_ckpt['ema_state_dict'] is not None:
+        print("Using EMA weights")
+        unet.load_state_dict(ddpm_ckpt['ema_state_dict'])
+    elif 'model_state_dict' in ddpm_ckpt:
+        unet.load_state_dict(ddpm_ckpt['model_state_dict'])
+    else:
+        unet.load_state_dict(ddpm_ckpt)
+    
     unet.eval()
     
     diffusion = GaussianDiffusion(timesteps=timesteps, device=device)
@@ -261,24 +313,29 @@ def compute_l2_norm(x1, x2):
     return l2
 
 
-def print_confusion_matrix(y_true, y_pred, title, classes):
-    """混同行列を表示"""
+def print_confusion_matrix_to_file(y_true, y_pred, title, classes, file_handle):
+    """混同行列をファイルに書き込み"""
     cm = confusion_matrix(y_true, y_pred, labels=list(range(len(classes))))
-    print(f"\n{title}")
-    print("-" * 60)
+    
+    def write_and_print(text):
+        print(text)
+        file_handle.write(text + '\n')
+    
+    write_and_print(f"\n{title}")
+    write_and_print("-" * 60)
     
     # ヘッダー
     header = f"{'':>15}"
     for cls in classes:
         header += f" {'Pred ' + cls:>12}"
-    print(header)
+    write_and_print(header)
     
     # 各行
     for i, cls in enumerate(classes):
         row = f"{'True ' + cls:>15}"
         for j in range(len(classes)):
             row += f" {cm[i,j]:>12}"
-        print(row)
+        write_and_print(row)
     
     # メトリクス
     if len(classes) == 2:
@@ -287,11 +344,11 @@ def print_confusion_matrix(y_true, y_pred, title, classes):
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-        print(f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+        write_and_print(f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
         return {'cm': cm, 'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1}
     else:
         accuracy = np.trace(cm) / np.sum(cm)
-        print(f"Accuracy: {accuracy:.4f}")
+        write_and_print(f"Accuracy: {accuracy:.4f}")
         return {'cm': cm, 'accuracy': accuracy}
 
 
@@ -341,18 +398,23 @@ def main():
     # モデル読み込み
     classifier, unet, diffusion = load_models(args, device)
     
-    # DDPM Purifier
-    purifier = DDPMPurifier(unet, diffusion, device, t_purify=args.t_purify, start_t=args.start_t)
+    # DDPM Purifier (Improved)
+    purifier = DDPMPurifierImproved(
+        unet, diffusion, device, 
+        t_purify=args.t_purify, 
+        start_t=args.start_t,
+        eta=args.eta
+    )
     
     # データ読み込み
     x_test, y_test, classes = load_cached_samples(args.cached_samples)
     
     # ==================== 評価開始 ====================
     print(f"\n{'='*70}")
-    print("FGSM Attack + DDPM Defense Evaluation")
+    print("FGSM Attack + DDPM Defense Evaluation (Improved)")
     print(f"{'='*70}")
     print(f"Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
-    print(f"DDPM Purification: t_purify={args.t_purify}, start_t={args.start_t}")
+    print(f"DDPM Purification: t_purify={args.t_purify}, start_t={args.start_t}, eta={args.eta}")
     print(f"Samples: {len(x_test)}")
     print(f"Classes: {classes}")
     print(f"{'='*70}")
@@ -426,11 +488,11 @@ def main():
             print(text)
             f.write(text + '\n')
         
-        write_and_print(f"{'='*70}")
-        write_and_print("FINAL RESULTS")
+        write_and_print(f"\n{'='*70}")
+        write_and_print("FINAL RESULTS (Improved)")
         write_and_print(f"{'='*70}")
         write_and_print(f"Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
-        write_and_print(f"DDPM: t_purify={args.t_purify}, start_t={args.start_t}")
+        write_and_print(f"DDPM: t_purify={args.t_purify}, start_t={args.start_t}, eta={args.eta}")
         write_and_print(f"-"*70)
         write_and_print(f"Clean Accuracy:")
         write_and_print(f"  Classifier only:             {results['clean_acc']:.4f}")
@@ -460,44 +522,6 @@ def main():
         write_and_print(f"\n{'='*70}")
         write_and_print("Confusion Matrices")
         write_and_print(f"{'='*70}")
-    
-    # 混同行列をファイルに書き込むバージョンの関数を作成
-    def print_confusion_matrix_to_file(y_true, y_pred, title, classes, file_handle):
-        cm = confusion_matrix(y_true, y_pred, labels=list(range(len(classes))))
-        
-        def write_and_print(text):
-            print(text)
-            file_handle.write(text + '\n')
-        
-        write_and_print(f"\n{title}")
-        write_and_print("-" * 60)
-        
-        # ヘッダー
-        header = f"{'':>15}"
-        for cls in classes:
-            header += f" {'Pred ' + cls:>12}"
-        write_and_print(header)
-        
-        # 各行
-        for i, cls in enumerate(classes):
-            row = f"{'True ' + cls:>15}"
-            for j in range(len(classes)):
-                row += f" {cm[i,j]:>12}"
-            write_and_print(row)
-        
-        # メトリクス
-        if len(classes) == 2:
-            tn, fp, fn, tp = cm.ravel()
-            accuracy = (tp + tn) / (tp + tn + fp + fn)
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-            write_and_print(f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
-            return {'cm': cm, 'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1}
-        else:
-            accuracy = np.trace(cm) / np.sum(cm)
-            write_and_print(f"Accuracy: {accuracy:.4f}")
-            return {'cm': cm, 'accuracy': accuracy}
     
     with open(results_txt_path, 'a') as f:
         cm1 = print_confusion_matrix_to_file(y_true, pred_clean, "1. Clean Images", classes, f)
