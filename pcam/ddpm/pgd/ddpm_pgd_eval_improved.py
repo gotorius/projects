@@ -1,5 +1,5 @@
 """
-DDPM-based Adversarial Defense Evaluation for PCam Dataset - FGSM Attack (Improved)
+DDPM-based Adversarial Defense Evaluation for PCam Dataset - PGD Attack (Improved)
 
 改善点:
 1. x0再構成を使用してノイズを抑制
@@ -7,7 +7,7 @@ DDPM-based Adversarial Defense Evaluation for PCam Dataset - FGSM Attack (Improv
 3. kaggleコードと同様の浄化アルゴリズム
 
 実行例:
-python ddpm_fgsm_eval_improved.py --epsilon 0.031 --t_purify 50 --start_t 80
+python ddpm_pgd_eval_improved.py --epsilon 0.031 --alpha 0.01 --steps 10
 """
 
 import os
@@ -34,11 +34,15 @@ from ddpm_train_pcam import SimpleUNet, GaussianDiffusion
 
 # ========== 引数パーサー ==========
 def parse_args():
-    parser = argparse.ArgumentParser(description='DDPM Defense Evaluation - FGSM Attack (Improved)')
+    parser = argparse.ArgumentParser(description='DDPM Defense Evaluation - PGD Attack (Improved)')
     
     # 攻撃設定
     parser.add_argument('--epsilon', type=float, default=8/255,
-                        help='FGSM perturbation epsilon')
+                        help='PGD perturbation bound')
+    parser.add_argument('--alpha', type=float, default=2/255,
+                        help='PGD step size')
+    parser.add_argument('--steps', type=int, default=10,
+                        help='PGD attack steps')
     
     # DDPM浄化設定
     parser.add_argument('--t_purify', type=int, default=50,
@@ -59,7 +63,7 @@ def parse_args():
                         default='/mnt/data1/gotou/projects/pcam/resnet/checkpoints/best_resnet50_pcam.pth',
                         help='Classifier checkpoint path')
     parser.add_argument('--output_dir', type=str,
-                        default='/mnt/data1/gotou/projects/pcam/ddpm/fgsm/results_improved',
+                        default='/mnt/data1/gotou/projects/pcam/ddpm/pgd/results_improved',
                         help='Output directory')
     
     # 実行設定
@@ -89,12 +93,6 @@ class DDPMPurifierImproved(nn.Module):
         self.t_purify = t_purify
         self.start_t = start_t
         self.eta = eta
-        
-        # 正規化用のテンソル
-        self.imagenet_mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
-        self.imagenet_std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
-        self.ddpm_mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
-        self.ddpm_std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
     
     def forward(self, x):
         """
@@ -223,25 +221,32 @@ def load_cached_samples(path):
     return x_test, y_test, classes
 
 
-# ========== FGSM攻撃 ==========
-def fgsm_attack(model, x, y, epsilon, device):
-    """FGSM攻撃"""
+# ========== PGD攻撃 ==========
+def pgd_attack(model, x, y, epsilon, alpha, steps, device):
+    """PGD攻撃"""
     x = x.clone().to(device)
-    x.requires_grad = True
+    x_adv = x.clone()
     
-    # 正規化
     mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
     std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
-    x_norm = (x - mean) / std
     
-    outputs = model(x_norm)
-    loss = F.cross_entropy(outputs, y.to(device))
-    loss.backward()
+    for _ in range(steps):
+        x_adv.requires_grad = True
+        
+        x_norm = (x_adv - mean) / std
+        outputs = model(x_norm)
+        loss = F.cross_entropy(outputs, y.to(device))
+        
+        loss.backward()
+        
+        with torch.no_grad():
+            x_adv = x_adv + alpha * x_adv.grad.sign()
+            x_adv = torch.min(torch.max(x_adv, x - epsilon), x + epsilon)
+            x_adv = torch.clamp(x_adv, 0, 1)
+        
+        x_adv = x_adv.detach()
     
-    x_adv = x + epsilon * x.grad.sign()
-    x_adv = torch.clamp(x_adv, 0, 1)
-    
-    return x_adv.detach()
+    return x_adv
 
 
 # ========== 評価関数 ==========
@@ -306,73 +311,62 @@ def evaluate_with_purification(purifier, classifier, x_test, y_test, device, bat
     return correct / total, np.array(predictions), x_purified_all
 
 
+# ========== ユーティリティ ==========
 def compute_l2_norm(x1, x2):
     """L2ノルムを計算"""
-    diff = (x1 - x2).view(len(x1), -1)
-    l2 = torch.norm(diff, p=2, dim=1).mean().item()
-    return l2
+    diff = (x1 - x2).view(x1.size(0), -1)
+    return torch.norm(diff, p=2, dim=1).mean().item()
 
 
-def print_confusion_matrix_to_file(y_true, y_pred, title, classes, file_handle):
-    """混同行列をファイルに書き込み"""
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(classes))))
+def print_confusion_matrix(y_true, y_pred, title, classes, file=None):
+    """混同行列を出力"""
+    cm = confusion_matrix(y_true, y_pred)
+    
+    # メトリクス計算
+    tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
     
     def write_and_print(text):
         print(text)
-        file_handle.write(text + '\n')
+        if file:
+            file.write(text + '\n')
     
     write_and_print(f"\n{title}")
     write_and_print("-" * 60)
     
-    # ヘッダー
-    header = f"{'':>15}"
-    for cls in classes:
-        header += f" {'Pred ' + cls:>12}"
+    header = f"{'':>15}" + "".join([f"Pred {c:>8}" for c in classes])
     write_and_print(header)
     
-    # 各行
-    for i, cls in enumerate(classes):
-        row = f"{'True ' + cls:>15}"
-        for j in range(len(classes)):
-            row += f" {cm[i,j]:>12}"
+    for i, true_class in enumerate(classes):
+        row = f"{'True ' + true_class:>15}" + "".join([f"{cm[i, j]:>12}" for j in range(len(classes))])
         write_and_print(row)
     
-    # メトリクス
-    if len(classes) == 2:
-        tn, fp, fn, tp = cm.ravel()
-        accuracy = (tp + tn) / (tp + tn + fp + fn)
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-        write_and_print(f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
-        return {'cm': cm, 'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1}
-    else:
-        accuracy = np.trace(cm) / np.sum(cm)
-        write_and_print(f"Accuracy: {accuracy:.4f}")
-        return {'cm': cm, 'accuracy': accuracy}
+    write_and_print(f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+    
+    return {
+        'cm': cm,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
 
 
-# ========== サンプル画像保存 ==========
-def save_sample_images(x_clean, x_adv, x_purified_clean, x_purified_adv,
-                       y_true, classes, save_dir, max_samples=10):
+def save_sample_images(x_clean, x_adv, x_purified_clean, x_purified_adv, labels, classes, save_dir):
     """サンプル画像を保存"""
     os.makedirs(save_dir, exist_ok=True)
-    n = min(len(x_clean), max_samples)
+    
+    n = min(len(x_clean), 10)
     
     for i in range(n):
-        label = int(y_true[i])
-        label_name = classes[label]
+        label = classes[labels[i]]
         
-        # 4枚を横に並べる
-        quad = torch.cat([
-            x_clean[i:i+1],
-            x_purified_clean[i:i+1],
-            x_adv[i:i+1],
-            x_purified_adv[i:i+1]
-        ], dim=0)
-        
-        grid = make_grid(quad, nrow=4, padding=5, pad_value=1.0)
-        save_image(grid, os.path.join(save_dir, f"sample_{i:04d}_{label_name}.png"))
+        images = [x_clean[i], x_adv[i], x_purified_clean[i], x_purified_adv[i]]
+        grid = make_grid(images, nrow=4, padding=2, normalize=False)
+        save_image(grid, os.path.join(save_dir, f'sample_{i}_{label}.png'))
     
     print(f"Saved {n} sample images to {save_dir}")
 
@@ -381,196 +375,167 @@ def save_sample_images(x_clean, x_adv, x_purified_clean, x_purified_adv,
 def main():
     args = parse_args()
     
-    # シード
+    # シード設定
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
     
     # デバイス
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # 出力ディレクトリ（月日時分の形式: MMDDHHMM）
+    # 出力ディレクトリ (MMDDHHMM形式)
     timestamp = datetime.now().strftime("%m%d%H%M")
     log_dir = os.path.join(args.output_dir, timestamp)
     os.makedirs(log_dir, exist_ok=True)
     print(f"Output directory: {log_dir}")
     
+    # 結果ファイル
+    results_file = open(os.path.join(log_dir, 'results.txt'), 'w')
+    
+    def write_and_print(text):
+        print(text)
+        results_file.write(text + '\n')
+    
     # モデル読み込み
     classifier, unet, diffusion = load_models(args, device)
     
-    # DDPM Purifier (Improved)
+    # Purifier作成
     purifier = DDPMPurifierImproved(
-        unet, diffusion, device, 
-        t_purify=args.t_purify, 
-        start_t=args.start_t,
-        eta=args.eta
+        unet, diffusion, device,
+        t_purify=args.t_purify, start_t=args.start_t, eta=args.eta
     )
     
     # データ読み込み
     x_test, y_test, classes = load_cached_samples(args.cached_samples)
     
-    # ==================== 評価開始 ====================
-    print(f"\n{'='*70}")
-    print("FGSM Attack + DDPM Defense Evaluation (Improved)")
-    print(f"{'='*70}")
-    print(f"Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
-    print(f"DDPM Purification: t_purify={args.t_purify}, start_t={args.start_t}, eta={args.eta}")
-    print(f"Samples: {len(x_test)}")
-    print(f"Classes: {classes}")
-    print(f"{'='*70}")
+    write_and_print(f"\n{'='*70}")
+    write_and_print("PGD Attack + DDPM Defense Evaluation (Improved)")
+    write_and_print(f"{'='*70}")
+    write_and_print(f"Attack: PGD, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
+    write_and_print(f"PGD Settings: Alpha: {args.alpha:.4f}, Steps: {args.steps}")
+    write_and_print(f"DDPM Purification: t_purify={args.t_purify}, start_t={args.start_t}, eta={args.eta}")
+    write_and_print(f"Samples: {len(x_test)}")
+    write_and_print(f"Classes: {classes}")
+    write_and_print(f"{'='*70}")
     
     results = {}
     
-    # ========== 1. クリーン画像の精度 ==========
-    print("\n[1/4] Evaluating clean images (classifier only)...")
+    # 1. クリーン画像の評価
+    write_and_print("\n[1/4] Evaluating clean images (classifier only)...")
     clean_acc, pred_clean = evaluate(classifier, x_test, y_test, device, args.batch_size)
-    print(f"Clean accuracy: {clean_acc:.4f}")
+    write_and_print(f"Clean accuracy: {clean_acc:.4f}")
     results['clean_acc'] = clean_acc
     
-    # ========== 2. クリーン画像をDDPMで浄化 ==========
-    print("\n[2/4] Evaluating clean images with DDPM purification...")
+    # 2. クリーン画像 + DDPM浄化
+    write_and_print("\n[2/4] Evaluating clean images with DDPM purification...")
     clean_purified_acc, pred_clean_purified, x_purified_clean = evaluate_with_purification(
         purifier, classifier, x_test, y_test, device, args.batch_size, "Purifying clean images"
     )
-    print(f"Clean accuracy (with DDPM): {clean_purified_acc:.4f}")
-    
-    # L2ノルム
-    l2_clean = compute_l2_norm(x_test, x_purified_clean)
-    print(f"L2 norm (clean vs purified): {l2_clean:.4f}")
+    l2_clean_purified = compute_l2_norm(x_test, x_purified_clean)
+    write_and_print(f"Clean accuracy (with DDPM): {clean_purified_acc:.4f}")
+    write_and_print(f"L2 norm (clean vs purified): {l2_clean_purified:.4f}")
     results['clean_acc_with_ddpm'] = clean_purified_acc
-    results['l2_clean_vs_purified'] = l2_clean
+    results['l2_clean_vs_purified'] = l2_clean_purified
     
-    # ========== 3. FGSM攻撃 ==========
-    print("\n[3/4] Running FGSM attack...")
+    # 3. PGD攻撃
+    write_and_print("\n[3/4] Running PGD attack...")
     start_time = time.time()
-    
     x_adv_list = []
-    for i in tqdm(range(0, len(x_test), args.batch_size), desc="FGSM Attack"):
+    for i in tqdm(range(0, len(x_test), args.batch_size), desc="PGD Attack"):
         x_batch = x_test[i:i+args.batch_size]
         y_batch = y_test[i:i+args.batch_size]
-        x_adv_batch = fgsm_attack(classifier, x_batch, y_batch, args.epsilon, device)
+        x_adv_batch = pgd_attack(classifier, x_batch, y_batch, args.epsilon, args.alpha, args.steps, device)
         x_adv_list.append(x_adv_batch.cpu())
-    
     x_adv = torch.cat(x_adv_list, dim=0)
     attack_time = time.time() - start_time
     
-    # L2ノルム
-    l2_adv = compute_l2_norm(x_test, x_adv)
-    print(f"L2 norm (clean vs adversarial): {l2_adv:.4f}")
-    results['l2_clean_vs_adv'] = l2_adv
-    
+    l2_clean_adv = compute_l2_norm(x_test, x_adv)
     adv_acc, pred_adv = evaluate(classifier, x_adv, y_test, device, args.batch_size)
-    print(f"Adversarial accuracy (no defense): {adv_acc:.4f}")
+    write_and_print(f"L2 norm (clean vs adversarial): {l2_clean_adv:.4f}")
+    write_and_print(f"Adversarial accuracy (no defense): {adv_acc:.4f}")
     results['adv_acc_no_defense'] = adv_acc
+    results['l2_clean_vs_adv'] = l2_clean_adv
     results['attack_time'] = attack_time
     
-    # ========== 4. 敵対的画像をDDPMで浄化 ==========
-    print("\n[4/4] Evaluating adversarial images with DDPM purification...")
+    # 4. 敵対的画像 + DDPM浄化
+    write_and_print("\n[4/4] Evaluating adversarial images with DDPM purification...")
     adv_purified_acc, pred_adv_purified, x_purified_adv = evaluate_with_purification(
         purifier, classifier, x_adv, y_test, device, args.batch_size, "Purifying adversarial images"
     )
-    print(f"Adversarial accuracy (with DDPM): {adv_purified_acc:.4f}")
-    
-    # L2ノルム
     l2_adv_purified = compute_l2_norm(x_adv, x_purified_adv)
-    print(f"L2 norm (adversarial vs purified): {l2_adv_purified:.4f}")
+    write_and_print(f"Adversarial accuracy (with DDPM): {adv_purified_acc:.4f}")
+    write_and_print(f"L2 norm (adversarial vs purified): {l2_adv_purified:.4f}")
     results['adv_acc_with_ddpm'] = adv_purified_acc
     results['l2_adv_vs_purified'] = l2_adv_purified
+    results['defense_improvement'] = adv_purified_acc - adv_acc
     
-    # 防御効果
-    defense_improvement = adv_purified_acc - adv_acc
-    results['defense_improvement'] = defense_improvement
+    # 最終結果
+    write_and_print(f"\n{'='*70}")
+    write_and_print("FINAL RESULTS (Improved)")
+    write_and_print(f"{'='*70}")
+    write_and_print(f"Attack: PGD, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
+    write_and_print(f"PGD Settings: Alpha: {args.alpha:.4f}, Steps: {args.steps}")
+    write_and_print(f"DDPM: t_purify={args.t_purify}, start_t={args.start_t}, eta={args.eta}")
+    write_and_print(f"-"*70)
+    write_and_print("Clean Accuracy:")
+    write_and_print(f"  Classifier only:             {results['clean_acc']:.4f}")
+    write_and_print(f"  With DDPM purification:      {results['clean_acc_with_ddpm']:.4f}")
+    write_and_print(f"-"*70)
+    write_and_print("Adversarial Accuracy (PGD):")
+    write_and_print(f"  Without defense:             {results['adv_acc_no_defense']:.4f}")
+    write_and_print(f"  With DDPM purification:      {results['adv_acc_with_ddpm']:.4f}")
+    write_and_print(f"  Defense improvement:         {results['defense_improvement']:+.4f}")
+    write_and_print(f"-"*70)
+    write_and_print("L2 Norms:")
+    write_and_print(f"  Clean vs Purified:           {results['l2_clean_vs_purified']:.4f}")
+    write_and_print(f"  Clean vs Adversarial:        {results['l2_clean_vs_adv']:.4f}")
+    write_and_print(f"  Adversarial vs Purified:     {results['l2_adv_vs_purified']:.4f}")
+    write_and_print(f"-"*70)
+    write_and_print(f"Attack time: {attack_time:.2f}s")
+    write_and_print(f"{'='*70}")
     
-    # ==================== 最終結果 ====================
-    results_txt_path = os.path.join(log_dir, 'results.txt')
-    with open(results_txt_path, 'w') as f:
-        def write_and_print(text):
-            print(text)
-            f.write(text + '\n')
-        
-        write_and_print(f"\n{'='*70}")
-        write_and_print("FINAL RESULTS (Improved)")
-        write_and_print(f"{'='*70}")
-        write_and_print(f"Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
-        write_and_print(f"DDPM: t_purify={args.t_purify}, start_t={args.start_t}, eta={args.eta}")
-        write_and_print(f"-"*70)
-        write_and_print(f"Clean Accuracy:")
-        write_and_print(f"  Classifier only:             {results['clean_acc']:.4f}")
-        write_and_print(f"  With DDPM purification:      {results['clean_acc_with_ddpm']:.4f}")
-        write_and_print(f"-"*70)
-        write_and_print(f"Adversarial Accuracy (FGSM):")
-        write_and_print(f"  Without defense:             {results['adv_acc_no_defense']:.4f}")
-        write_and_print(f"  With DDPM purification:      {results['adv_acc_with_ddpm']:.4f}")
-        write_and_print(f"  Defense improvement:         {results['defense_improvement']:+.4f}")
-        write_and_print(f"-"*70)
-        write_and_print(f"L2 Norms:")
-        write_and_print(f"  Clean vs Purified:           {results['l2_clean_vs_purified']:.4f}")
-        write_and_print(f"  Clean vs Adversarial:        {results['l2_clean_vs_adv']:.4f}")
-        write_and_print(f"  Adversarial vs Purified:     {results['l2_adv_vs_purified']:.4f}")
-        write_and_print(f"-"*70)
-        write_and_print(f"Attack time: {results['attack_time']:.2f}s")
-        write_and_print(f"{'='*70}")
+    # 混同行列
+    write_and_print(f"\n{'='*70}")
+    write_and_print("Confusion Matrices")
+    write_and_print(f"{'='*70}")
     
-    # ==================== 混同行列 ====================
     y_true = y_test.numpy()
+    cm_results = {}
+    cm_results['clean'] = print_confusion_matrix(y_true, pred_clean, "1. Clean Images", classes, results_file)
+    cm_results['clean_purified'] = print_confusion_matrix(y_true, pred_clean_purified, "2. Clean Images (with DDPM)", classes, results_file)
+    cm_results['adv_no_defense'] = print_confusion_matrix(y_true, pred_adv, "3. Adversarial Images (No Defense)", classes, results_file)
+    cm_results['adv_purified'] = print_confusion_matrix(y_true, pred_adv_purified, "4. Adversarial Images (with DDPM)", classes, results_file)
     
-    with open(results_txt_path, 'a') as f:
-        def write_and_print(text):
-            print(text)
-            f.write(text + '\n')
-        
-        write_and_print(f"\n{'='*70}")
-        write_and_print("Confusion Matrices")
-        write_and_print(f"{'='*70}")
+    # サンプル画像保存
+    write_and_print("\nSaving sample images...")
+    samples_dir = os.path.join(log_dir, 'samples')
+    save_sample_images(x_test[:10], x_adv[:10], x_purified_clean[:10], x_purified_adv[:10],
+                       y_test[:10], classes, samples_dir)
     
-    with open(results_txt_path, 'a') as f:
-        cm1 = print_confusion_matrix_to_file(y_true, pred_clean, "1. Clean Images", classes, f)
-        cm2 = print_confusion_matrix_to_file(y_true, pred_clean_purified, "2. Clean Images (with DDPM)", classes, f)
-        cm3 = print_confusion_matrix_to_file(y_true, pred_adv, "3. Adversarial Images (No Defense)", classes, f)
-        cm4 = print_confusion_matrix_to_file(y_true, pred_adv_purified, "4. Adversarial Images (with DDPM)", classes, f)
+    results_file.close()
     
-    results['confusion_matrices'] = {
-        'clean': cm1,
-        'clean_purified': cm2,
-        'adv_no_defense': cm3,
-        'adv_purified': cm4
+    # JSON形式でも保存
+    results_save = {
+        'config': vars(args),
+        'results': {k: float(v) if isinstance(v, (float, np.floating)) else v for k, v in results.items()},
+        'confusion_matrices': {
+            k: {
+                'cm': v['cm'].tolist(),
+                'accuracy': float(v['accuracy']),
+                'precision': float(v['precision']),
+                'recall': float(v['recall']),
+                'f1': float(v['f1'])
+            } for k, v in cm_results.items()
+        }
     }
-    
-    # ==================== サンプル画像保存 ====================
-    print("\nSaving sample images...")
-    save_sample_images(
-        x_test[:10],
-        x_adv[:10],
-        x_purified_clean[:10],
-        x_purified_adv[:10],
-        y_test[:10],
-        classes,
-        os.path.join(log_dir, 'samples')
-    )
-    
-    # 結果保存
-    results_save = {}
-    for k, v in results.items():
-        if k == 'confusion_matrices':
-            results_save[k] = {}
-            for kk, vv in v.items():
-                if 'cm' in vv:
-                    results_save[k][kk] = {
-                        kkk: (int(vvv) if isinstance(vvv, (int, np.integer)) else 
-                              vvv.tolist() if isinstance(vvv, np.ndarray) else float(vvv))
-                        for kkk, vvv in vv.items()
-                    }
-        else:
-            results_save[k] = float(v) if isinstance(v, (float, np.floating)) else v
     
     with open(os.path.join(log_dir, 'results.json'), 'w') as f:
         json.dump(results_save, f, indent=2)
     
-    with open(os.path.join(log_dir, 'config.json'), 'w') as f:
-        json.dump(vars(args), f, indent=2)
-    
     print(f"\nResults saved to {log_dir}")
-    print(f"Text results: {results_txt_path}")
+    print(f"Text results: {os.path.join(log_dir, 'results.txt')}")
 
 
 if __name__ == '__main__':

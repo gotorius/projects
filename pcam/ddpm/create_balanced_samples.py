@@ -2,6 +2,9 @@
 バランスの取れたサンプルセットを作成
 normal: 250枚、tumor: 250枚の合計500枚
 分類器で正しく分類された画像のみを使用
+
+正しいデータセット: /mnt/data1/Public/MedImages/PCam_ImageFolder/test
+（分類器とDDPMの訓練に使用したデータセットと同じ）
 """
 
 import os
@@ -10,9 +13,9 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, TensorDataset
+from torchvision import datasets
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-import h5py
 import numpy as np
 
 # 定数
@@ -41,49 +44,26 @@ def main():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # パス設定
-    test_x_path = '/mnt/data1/gotou/kaggle/pcamdata/camelyonpatch_level_2_split_test_x.h5'
-    test_y_path = '/mnt/data1/gotou/kaggle/pcamdata/camelyonpatch_level_2_split_test_y.h5'
+    # パス設定（正しいデータセット）
+    test_data_dir = '/mnt/data1/Public/MedImages/PCam_ImageFolder/test'
     clf_ckpt = '/mnt/data1/gotou/projects/pcam/resnet/checkpoints/best_resnet50_pcam.pth'
     output_path = '/mnt/data1/gotou/projects/pcam/ddpm/correct_samples_balanced_500.pt'
     
-    # データ読み込み
-    print("Loading test data from H5 files...")
-    with h5py.File(test_x_path, 'r') as f:
-        x_data = f['x'][:]  # (N, 96, 96, 3)
-    with h5py.File(test_y_path, 'r') as f:
-        y_data = f['y'][:, 0, 0, 0]  # (N,)
-    
-    print(f"Loaded {len(x_data)} samples")
-    print(f"Label distribution: {np.bincount(y_data)}")
-    
-    # データ前処理: (N, 96, 96, 3) -> (N, 3, 224, 224), [0, 1]
-    print("Preprocessing images...")
-    x_tensor_list = []
-    batch_size_preprocess = 100
-    
+    # データ変換（ImageNetの正規化なし、[0,1]のピクセル値で保存）
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
+        transforms.ToTensor(),  # [0, 1]
     ])
     
-    for i in tqdm(range(0, len(x_data), batch_size_preprocess), desc="Resizing"):
-        batch = x_data[i:i+batch_size_preprocess]
-        # (B, 96, 96, 3) -> (B, 3, 96, 96), uint8 -> float32 [0, 1]
-        batch_tensor = torch.from_numpy(batch).permute(0, 3, 1, 2).float() / 255.0
-        # Resize to 224x224
-        batch_resized = transform(batch_tensor)
-        x_tensor_list.append(batch_resized)
+    # ImageFolderでデータ読み込み
+    print(f"Loading test data from {test_data_dir}...")
+    test_dataset = datasets.ImageFolder(test_data_dir, transform=transform)
+    dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
     
-    x_all = torch.cat(x_tensor_list, dim=0)
-    y_all = torch.from_numpy(y_data).long()
-    
-    print(f"Preprocessed shape: {x_all.shape}")
-    
-    # データローダー
-    dataset = TensorDataset(x_all, y_all)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=4)
-    
-    classes = ['normal', 'tumor']
+    # クラス名を取得（ImageFolderはアルファベット順でソート: normal=0, tumor=1）
+    classes = test_dataset.classes
+    print(f"Classes: {classes}")
+    print(f"Total samples: {len(test_dataset)}")
     
     # 分類器読み込み
     classifier = load_classifier(clf_ckpt, num_classes=2, device=device)
@@ -149,7 +129,7 @@ def main():
     torch.save(data, output_path)
     print(f"\nSaved balanced samples to {output_path}")
     print(f"Total samples: {len(x_test)}")
-    print(f"Label distribution: {torch.bincount(y_test)}")
+    print(f"Label distribution: {torch.bincount(y_test).tolist()}")
     print(f"Classes: {classes}")
 
 if __name__ == '__main__':
