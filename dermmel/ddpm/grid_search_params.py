@@ -1,13 +1,10 @@
 """
-DermMel - PGD Attack + DDPM Defense Evaluation (Improved)
+DermMel - DDPM Defense Parameter Grid Search
 
-改善点:
-1. x0再構成を使用してノイズを抑制
-2. 適切な正規化変換(ImageNet ⇔ DDPM)
-3. cosineスケジュール対応
+start_tとt_purifyの最適パラメータを探索
 
 実行例:
-python ddpm_pgd_eval_improved.py --epsilon 0.031 --t_purify 50 --start_t 80
+python grid_search_params.py --gpu 0
 """
 
 import os
@@ -17,37 +14,37 @@ import argparse
 import time
 import json
 from datetime import datetime
-from pathlib import Path
+from itertools import product
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
-from torchvision.utils import save_image, make_grid
-from sklearn.metrics import confusion_matrix
 import numpy as np
 from tqdm.auto import tqdm
 
 
 # ========== 引数パーサー ==========
 def parse_args():
-    parser = argparse.ArgumentParser(description='DermMel DDPM Defense Evaluation - PGD Attack')
+    parser = argparse.ArgumentParser(description='DermMel DDPM Parameter Grid Search')
     
     # 攻撃設定
     parser.add_argument('--epsilon', type=float, default=8/255,
-                        help='PGD perturbation epsilon')
-    parser.add_argument('--alpha', type=float, default=2/255,
-                        help='PGD step size')
-    parser.add_argument('--pgd_steps', type=int, default=10,
-                        help='Number of PGD steps')
-    parser.add_argument('--random_start', type=bool, default=True,
-                        help='Random start for PGD')
+                        help='FGSM perturbation epsilon')
     
-    # DDPM浄化設定
-    parser.add_argument('--t_purify', type=int, default=50,
-                        help='Number of diffusion steps for purification')
-    parser.add_argument('--start_t', type=int, default=80,
-                        help='Starting timestep for reverse diffusion')
+    # グリッドサーチ設定
+    parser.add_argument('--start_t_min', type=int, default=50,
+                        help='Minimum start_t')
+    parser.add_argument('--start_t_max', type=int, default=150,
+                        help='Maximum start_t')
+    parser.add_argument('--start_t_step', type=int, default=10,
+                        help='Step size for start_t')
+    parser.add_argument('--t_purify_min', type=int, default=10,
+                        help='Minimum t_purify')
+    parser.add_argument('--t_purify_max', type=int, default=100,
+                        help='Maximum t_purify')
+    parser.add_argument('--t_purify_step', type=int, default=10,
+                        help='Step size for t_purify')
     parser.add_argument('--eta', type=float, default=0.0,
                         help='Stochasticity parameter for DDIM')
     
@@ -62,13 +59,15 @@ def parse_args():
                         default='/mnt/data1/gotou/projects/dermmel/resnet/resnet50_best.pth',
                         help='Classifier checkpoint path')
     parser.add_argument('--output_dir', type=str,
-                        default='/mnt/data1/gotou/projects/dermmel/ddpm/pgd/results',
+                        default='/mnt/data1/gotou/projects/dermmel/ddpm/grid_search_results',
                         help='Output directory')
     
     # 実行設定
-    parser.add_argument('--batch_size', type=int, default=16,
+    parser.add_argument('--num_samples', type=int, default=100,
+                        help='Number of samples for grid search (balanced)')
+    parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for evaluation')
-    parser.add_argument('--gpu', type=int, default=1,
+    parser.add_argument('--gpu', type=int, default=0,
                         help='GPU ID')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
@@ -263,8 +262,8 @@ class GaussianDiffusion:
         return betas.to(torch.float32)
 
 
-# ========== DDPM Purifier (Improved) ==========
-class DDPMPurifierImproved(nn.Module):
+# ========== DDPM Purifier ==========
+class DDPMPurifier(nn.Module):
     def __init__(self, unet, diffusion, device, t_purify=50, start_t=80, eta=0.0):
         super().__init__()
         self.unet = unet
@@ -273,6 +272,11 @@ class DDPMPurifierImproved(nn.Module):
         self.t_purify = t_purify
         self.start_t = start_t
         self.eta = eta
+    
+    def set_params(self, start_t, t_purify):
+        """パラメータを動的に設定"""
+        self.start_t = start_t
+        self.t_purify = t_purify
     
     @torch.no_grad()
     def forward(self, x):
@@ -316,6 +320,7 @@ class DDPMPurifierImproved(nn.Module):
             eps_pred_final = eps_pred
             t_final = curr_t
         
+        # x0再構成
         alpha_bar_tf = self.diffusion.alphas_cumprod[t_final]
         x0_hat = (x_t - torch.sqrt(1 - alpha_bar_tf) * eps_pred_final) / torch.sqrt(alpha_bar_tf + 1e-12)
         x0_hat = torch.clamp(x0_hat, -1.0, 1.0)
@@ -362,46 +367,63 @@ def load_ddpm(args, device):
     return unet, diffusion
 
 
-def load_cached_samples(path):
-    data = torch.load(path, map_location='cpu')
+def load_and_subsample(args, device):
+    """キャッシュサンプルからバランスの取れたサブセットを取得"""
+    data = torch.load(args.cached_samples, map_location='cpu')
     x_test = data['x_test']
     y_test = data['y_test']
     classes = data['classes']
-    print(f"Loaded {len(x_test)} samples from {path}")
-    print(f"Classes: {classes}")
-    return x_test, y_test, classes
+    
+    # クラスごとにインデックスを取得
+    class_indices = {}
+    for i, label in enumerate(y_test):
+        label_int = label.item()
+        if label_int not in class_indices:
+            class_indices[label_int] = []
+        class_indices[label_int].append(i)
+    
+    # 各クラスから均等にサンプリング
+    samples_per_class = args.num_samples // len(classes)
+    selected_indices = []
+    
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    
+    for label, indices in class_indices.items():
+        if len(indices) >= samples_per_class:
+            selected = np.random.choice(indices, samples_per_class, replace=False)
+        else:
+            selected = indices
+        selected_indices.extend(selected)
+    
+    selected_indices = sorted(selected_indices)
+    
+    x_subset = x_test[selected_indices]
+    y_subset = y_test[selected_indices]
+    
+    print(f"Selected {len(x_subset)} samples ({samples_per_class} per class)")
+    for i, cls in enumerate(classes):
+        count = (y_subset == i).sum().item()
+        print(f"  {cls}: {count}")
+    
+    return x_subset, y_subset, classes
 
 
-# ========== PGD攻撃 ==========
-def pgd_attack(model, x, y, epsilon, alpha, steps, device, random_start=True):
-    """PGD攻撃"""
+# ========== FGSM攻撃 ==========
+def fgsm_attack(model, x, y, epsilon, device):
     x = x.clone().to(device)
-    y = y.to(device)
+    x.requires_grad = True
     
     mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
     std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
+    x_norm = (x - mean) / std
     
-    if random_start:
-        x_adv = x + torch.empty_like(x).uniform_(-epsilon, epsilon)
-        x_adv = torch.clamp(x_adv, 0, 1)
-    else:
-        x_adv = x.clone()
+    outputs = model(x_norm)
+    loss = F.cross_entropy(outputs, y.to(device))
+    loss.backward()
     
-    for _ in range(steps):
-        x_adv.requires_grad = True
-        
-        x_norm = (x_adv - mean) / std
-        outputs = model(x_norm)
-        loss = F.cross_entropy(outputs, y)
-        
-        model.zero_grad()
-        loss.backward()
-        
-        grad = x_adv.grad.detach()
-        x_adv = x_adv.detach() + alpha * grad.sign()
-        
-        delta = torch.clamp(x_adv - x, -epsilon, epsilon)
-        x_adv = torch.clamp(x + delta, 0, 1)
+    x_adv = x + epsilon * x.grad.sign()
+    x_adv = torch.clamp(x_adv, 0, 1)
     
     return x_adv.detach()
 
@@ -411,7 +433,6 @@ def evaluate(model, x_test, y_test, device, batch_size=16):
     model.eval()
     correct = 0
     total = 0
-    predictions = []
     
     mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
     std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
@@ -427,29 +448,25 @@ def evaluate(model, x_test, y_test, device, batch_size=16):
             
             correct += (predicted == y_batch).sum().item()
             total += y_batch.size(0)
-            predictions.extend(predicted.cpu().numpy())
     
-    return correct / total, np.array(predictions)
+    return correct / total
 
 
-def evaluate_with_purification(purifier, classifier, x_test, y_test, device, batch_size=8, desc="Purifying"):
+def evaluate_with_purification(purifier, classifier, x_test, y_test, device, batch_size=8):
     classifier.eval()
     
     correct = 0
     total = 0
-    predictions = []
-    x_purified_all = []
     
     mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
     std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
     
     with torch.no_grad():
-        for i in tqdm(range(0, len(x_test), batch_size), desc=desc):
+        for i in range(0, len(x_test), batch_size):
             x_batch = x_test[i:i+batch_size].to(device)
             y_batch = y_test[i:i+batch_size].to(device)
             
             x_purified = purifier(x_batch)
-            x_purified_all.append(x_purified.cpu())
             
             x_norm = (x_purified - mean) / std
             outputs = classifier(x_norm)
@@ -457,57 +474,84 @@ def evaluate_with_purification(purifier, classifier, x_test, y_test, device, bat
             
             correct += (predicted == y_batch).sum().item()
             total += y_batch.size(0)
-            predictions.extend(predicted.cpu().numpy())
     
-    x_purified_all = torch.cat(x_purified_all, dim=0)
-    return correct / total, np.array(predictions), x_purified_all
+    return correct / total
 
 
-def compute_l2_norm(x1, x2):
-    diff = (x1 - x2).view(x1.size(0), -1)
-    return torch.norm(diff, p=2, dim=1).mean().item()
-
-
-def print_confusion_matrix(y_true, y_pred, title, classes, file=None):
-    cm = confusion_matrix(y_true, y_pred)
+# ========== グリッドサーチ ==========
+def grid_search(args, classifier, purifier, x_clean, x_adv, y_test, device):
+    """パラメータのグリッドサーチを実行"""
     
-    tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
-    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    # パラメータ範囲
+    start_t_values = list(range(args.start_t_min, args.start_t_max + 1, args.start_t_step))
+    t_purify_values = list(range(args.t_purify_min, args.t_purify_max + 1, args.t_purify_step))
     
-    def write_and_print(text):
-        print(text)
-        if file:
-            file.write(text + '\n')
+    print(f"\nGrid Search Parameters:")
+    print(f"  start_t: {start_t_values}")
+    print(f"  t_purify: {t_purify_values}")
+    print(f"  Total combinations: {len(start_t_values) * len(t_purify_values)}")
     
-    write_and_print(f"\n{title}")
-    write_and_print("-" * 60)
+    results = []
+    best_result = None
+    best_score = -1
     
-    header = f"{'':>15}" + "".join([f"Pred {c:>8}" for c in classes])
-    write_and_print(header)
+    total_combos = len(start_t_values) * len(t_purify_values)
+    pbar = tqdm(total=total_combos, desc="Grid Search")
     
-    for i, true_class in enumerate(classes):
-        row = f"{'True ' + true_class:>15}" + "".join([f"{cm[i, j]:>12}" for j in range(len(classes))])
-        write_and_print(row)
+    for start_t, t_purify in product(start_t_values, t_purify_values):
+        # t_purifyがstart_tを超えないようにする
+        if t_purify > start_t:
+            pbar.update(1)
+            continue
+        
+        # パラメータ設定
+        purifier.set_params(start_t, t_purify)
+        
+        # クリーン画像の浄化後精度
+        clean_purified_acc = evaluate_with_purification(
+            purifier, classifier, x_clean, y_test, device, args.batch_size
+        )
+        
+        # 敵対的画像の浄化後精度
+        adv_purified_acc = evaluate_with_purification(
+            purifier, classifier, x_adv, y_test, device, args.batch_size
+        )
+        
+        # 防御改善量
+        defense_improvement = adv_purified_acc  # 元々0%なので
+        
+        # 総合スコア: クリーン精度と敵対的精度の調和平均
+        if clean_purified_acc > 0 and adv_purified_acc > 0:
+            harmonic_mean = 2 * clean_purified_acc * adv_purified_acc / (clean_purified_acc + adv_purified_acc)
+        else:
+            harmonic_mean = 0
+        
+        result = {
+            'start_t': start_t,
+            't_purify': t_purify,
+            'clean_purified_acc': clean_purified_acc,
+            'adv_purified_acc': adv_purified_acc,
+            'harmonic_mean': harmonic_mean
+        }
+        results.append(result)
+        
+        # ベスト更新チェック
+        if harmonic_mean > best_score:
+            best_score = harmonic_mean
+            best_result = result
+        
+        pbar.set_postfix({
+            'start_t': start_t,
+            't_purify': t_purify,
+            'clean': f'{clean_purified_acc:.2%}',
+            'adv': f'{adv_purified_acc:.2%}',
+            'best': f'{best_score:.2%}'
+        })
+        pbar.update(1)
     
-    write_and_print(f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+    pbar.close()
     
-    return {'cm': cm, 'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1}
-
-
-def save_sample_images(x_clean, x_adv, x_purified_clean, x_purified_adv, labels, classes, save_dir):
-    os.makedirs(save_dir, exist_ok=True)
-    n = min(len(x_clean), 10)
-    
-    for i in range(n):
-        label = classes[labels[i]]
-        images = [x_clean[i], x_adv[i], x_purified_clean[i], x_purified_adv[i]]
-        grid = make_grid(images, nrow=4, padding=2, normalize=False)
-        save_image(grid, os.path.join(save_dir, f'sample_{i}_{label}.png'))
-    
-    print(f"Saved {n} sample images to {save_dir}")
+    return results, best_result
 
 
 # ========== メイン ==========
@@ -522,148 +566,113 @@ def main():
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
+    # 出力ディレクトリ
     timestamp = datetime.now().strftime("%m%d%H%M")
     log_dir = os.path.join(args.output_dir, timestamp)
     os.makedirs(log_dir, exist_ok=True)
     print(f"Output directory: {log_dir}")
     
-    results_file = open(os.path.join(log_dir, 'results.txt'), 'w')
-    
-    def write_and_print(text):
-        print(text)
-        results_file.write(text + '\n')
-    
+    # モデル読み込み
     classifier = load_classifier(args, device)
     unet, diffusion = load_ddpm(args, device)
     
-    purifier = DDPMPurifierImproved(
-        unet, diffusion, device,
-        t_purify=args.t_purify, start_t=args.start_t, eta=args.eta
-    )
+    # 浄化器作成（初期パラメータは後で変更）
+    purifier = DDPMPurifier(unet, diffusion, device, t_purify=50, start_t=80, eta=args.eta)
     
-    x_test, y_test, classes = load_cached_samples(args.cached_samples)
+    # データ読み込み（バランスの取れたサブセット）
+    x_clean, y_test, classes = load_and_subsample(args, device)
     
-    write_and_print(f"\n{'='*70}")
-    write_and_print("PGD Attack + DDPM Defense Evaluation (DermMel)")
-    write_and_print(f"{'='*70}")
-    write_and_print(f"Attack: PGD, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
-    write_and_print(f"       Alpha: {args.alpha:.4f} ({args.alpha*255:.1f}/255), Steps: {args.pgd_steps}")
-    write_and_print(f"DDPM: start_t={args.start_t}, t_purify={args.t_purify}, eta={args.eta}")
-    write_and_print(f"Samples: {len(x_test)}")
-    write_and_print(f"Classes: {classes}")
-    write_and_print(f"{'='*70}")
+    print(f"\n{'='*70}")
+    print("DDPM Parameter Grid Search (DermMel)")
+    print(f"{'='*70}")
+    print(f"Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
+    print(f"Samples: {len(x_clean)} (balanced)")
+    print(f"Classes: {classes}")
+    print(f"{'='*70}")
     
-    results = {}
+    # クリーン精度を確認
+    clean_acc = evaluate(classifier, x_clean, y_test, device, args.batch_size)
+    print(f"\nClean accuracy (no defense): {clean_acc:.4f}")
     
-    write_and_print("\n[1/4] Evaluating clean images (classifier only)...")
-    clean_acc, pred_clean = evaluate(classifier, x_test, y_test, device, args.batch_size)
-    write_and_print(f"Clean accuracy: {clean_acc:.4f}")
-    results['clean_acc'] = clean_acc
-    
-    write_and_print("\n[2/4] Evaluating clean images with DDPM purification...")
-    clean_purified_acc, pred_clean_purified, x_purified_clean = evaluate_with_purification(
-        purifier, classifier, x_test, y_test, device, args.batch_size, "Purifying clean images"
-    )
-    l2_clean_purified = compute_l2_norm(x_test, x_purified_clean)
-    write_and_print(f"Clean accuracy (with DDPM): {clean_purified_acc:.4f}")
-    write_and_print(f"L2 norm (clean vs purified): {l2_clean_purified:.4f}")
-    results['clean_acc_with_ddpm'] = clean_purified_acc
-    results['l2_clean_vs_purified'] = l2_clean_purified
-    
-    write_and_print("\n[3/4] Running PGD attack...")
-    start_time = time.time()
+    # FGSM攻撃
+    print("\nGenerating adversarial examples (FGSM)...")
     x_adv_list = []
-    for i in tqdm(range(0, len(x_test), args.batch_size), desc="PGD Attack"):
-        x_batch = x_test[i:i+args.batch_size]
+    for i in tqdm(range(0, len(x_clean), args.batch_size), desc="FGSM Attack"):
+        x_batch = x_clean[i:i+args.batch_size]
         y_batch = y_test[i:i+args.batch_size]
-        x_adv_batch = pgd_attack(
-            classifier, x_batch, y_batch,
-            args.epsilon, args.alpha, args.pgd_steps, device, args.random_start
-        )
+        x_adv_batch = fgsm_attack(classifier, x_batch, y_batch, args.epsilon, device)
         x_adv_list.append(x_adv_batch.cpu())
     x_adv = torch.cat(x_adv_list, dim=0)
-    attack_time = time.time() - start_time
     
-    l2_clean_adv = compute_l2_norm(x_test, x_adv)
-    adv_acc, pred_adv = evaluate(classifier, x_adv, y_test, device, args.batch_size)
-    write_and_print(f"L2 norm (clean vs adversarial): {l2_clean_adv:.4f}")
-    write_and_print(f"Adversarial accuracy (no defense): {adv_acc:.4f}")
-    results['adv_acc_no_defense'] = adv_acc
-    results['l2_clean_vs_adv'] = l2_clean_adv
-    results['attack_time'] = attack_time
+    adv_acc = evaluate(classifier, x_adv, y_test, device, args.batch_size)
+    print(f"Adversarial accuracy (no defense): {adv_acc:.4f}")
     
-    write_and_print("\n[4/4] Evaluating adversarial images with DDPM purification...")
-    adv_purified_acc, pred_adv_purified, x_purified_adv = evaluate_with_purification(
-        purifier, classifier, x_adv, y_test, device, args.batch_size, "Purifying adversarial images"
-    )
-    l2_adv_purified = compute_l2_norm(x_adv, x_purified_adv)
-    write_and_print(f"Adversarial accuracy (with DDPM): {adv_purified_acc:.4f}")
-    write_and_print(f"L2 norm (adversarial vs purified): {l2_adv_purified:.4f}")
-    results['adv_acc_with_ddpm'] = adv_purified_acc
-    results['l2_adv_vs_purified'] = l2_adv_purified
-    results['defense_improvement'] = adv_purified_acc - adv_acc
+    # グリッドサーチ実行
+    print("\nStarting grid search...")
+    start_time = time.time()
+    results, best_result = grid_search(args, classifier, purifier, x_clean, x_adv, y_test, device)
+    elapsed_time = time.time() - start_time
     
-    write_and_print(f"\n{'='*70}")
-    write_and_print("FINAL RESULTS")
-    write_and_print(f"{'='*70}")
-    write_and_print(f"Attack: PGD, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
-    write_and_print(f"       Alpha: {args.alpha:.4f}, Steps: {args.pgd_steps}")
-    write_and_print(f"Defense: DDPM, start_t={args.start_t}, t_purify={args.t_purify}")
-    write_and_print(f"-"*70)
-    write_and_print("Clean Accuracy:")
-    write_and_print(f"  Classifier only:             {results['clean_acc']:.4f}")
-    write_and_print(f"  With DDPM:                   {results['clean_acc_with_ddpm']:.4f}")
-    write_and_print(f"-"*70)
-    write_and_print("Adversarial Accuracy (PGD):")
-    write_and_print(f"  Without defense:             {results['adv_acc_no_defense']:.4f}")
-    write_and_print(f"  With DDPM:                   {results['adv_acc_with_ddpm']:.4f}")
-    write_and_print(f"  Defense improvement:         {results['defense_improvement']:+.4f}")
-    write_and_print(f"-"*70)
-    write_and_print("L2 Norms:")
-    write_and_print(f"  Clean vs Purified:           {results['l2_clean_vs_purified']:.4f}")
-    write_and_print(f"  Clean vs Adversarial:        {results['l2_clean_vs_adv']:.4f}")
-    write_and_print(f"  Adversarial vs Purified:     {results['l2_adv_vs_purified']:.4f}")
-    write_and_print(f"-"*70)
-    write_and_print(f"Attack time: {attack_time:.2f}s")
-    write_and_print(f"{'='*70}")
+    # 結果表示
+    print(f"\n{'='*70}")
+    print("GRID SEARCH RESULTS")
+    print(f"{'='*70}")
+    print(f"Total time: {elapsed_time:.2f}s")
+    print(f"Total combinations tested: {len(results)}")
+    print(f"\nBest Parameters:")
+    print(f"  start_t: {best_result['start_t']}")
+    print(f"  t_purify: {best_result['t_purify']}")
+    print(f"  Clean accuracy (with DDPM): {best_result['clean_purified_acc']:.4f}")
+    print(f"  Adversarial accuracy (with DDPM): {best_result['adv_purified_acc']:.4f}")
+    print(f"  Harmonic mean: {best_result['harmonic_mean']:.4f}")
+    print(f"{'='*70}")
     
-    write_and_print(f"\n{'='*70}")
-    write_and_print("Confusion Matrices")
-    write_and_print(f"{'='*70}")
+    # 上位10結果を表示
+    sorted_results = sorted(results, key=lambda x: x['harmonic_mean'], reverse=True)
+    print("\nTop 10 Results (by harmonic mean):")
+    print("-" * 70)
+    print(f"{'Rank':>4} {'start_t':>8} {'t_purify':>8} {'Clean':>8} {'Adv':>8} {'HMean':>8}")
+    print("-" * 70)
+    for i, r in enumerate(sorted_results[:10]):
+        print(f"{i+1:>4} {r['start_t']:>8} {r['t_purify']:>8} {r['clean_purified_acc']:>8.4f} {r['adv_purified_acc']:>8.4f} {r['harmonic_mean']:>8.4f}")
     
-    y_true = y_test.numpy()
-    cm_results = {}
-    cm_results['clean'] = print_confusion_matrix(y_true, pred_clean, "1. Clean Images", classes, results_file)
-    cm_results['clean_purified'] = print_confusion_matrix(y_true, pred_clean_purified, "2. Clean Images (with DDPM)", classes, results_file)
-    cm_results['adv_no_defense'] = print_confusion_matrix(y_true, pred_adv, "3. Adversarial Images (No Defense)", classes, results_file)
-    cm_results['adv_purified'] = print_confusion_matrix(y_true, pred_adv_purified, "4. Adversarial Images (with DDPM)", classes, results_file)
-    
-    write_and_print("\nSaving sample images...")
-    samples_dir = os.path.join(log_dir, 'samples')
-    save_sample_images(x_test[:10], x_adv[:10], x_purified_clean[:10], x_purified_adv[:10],
-                       y_test[:10], classes, samples_dir)
-    
-    results_file.close()
-    
-    results_save = {
+    # 結果保存
+    output_data = {
         'config': vars(args),
-        'results': {k: float(v) if isinstance(v, (float, np.floating)) else v for k, v in results.items()},
-        'confusion_matrices': {
-            k: {
-                'cm': v['cm'].tolist(),
-                'accuracy': float(v['accuracy']),
-                'precision': float(v['precision']),
-                'recall': float(v['recall']),
-                'f1': float(v['f1'])
-            } for k, v in cm_results.items()
-        }
+        'clean_acc_no_defense': clean_acc,
+        'adv_acc_no_defense': adv_acc,
+        'best_result': best_result,
+        'all_results': results,
+        'elapsed_time': elapsed_time
     }
     
     with open(os.path.join(log_dir, 'results.json'), 'w') as f:
-        json.dump(results_save, f, indent=2)
+        json.dump(output_data, f, indent=2)
+    
+    # テキストレポート保存
+    with open(os.path.join(log_dir, 'results.txt'), 'w') as f:
+        f.write("="*70 + "\n")
+        f.write("DDPM Parameter Grid Search Results (DermMel)\n")
+        f.write("="*70 + "\n\n")
+        f.write(f"Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)\n")
+        f.write(f"Samples: {len(x_clean)} (balanced)\n")
+        f.write(f"Total time: {elapsed_time:.2f}s\n\n")
+        f.write(f"Clean accuracy (no defense): {clean_acc:.4f}\n")
+        f.write(f"Adversarial accuracy (no defense): {adv_acc:.4f}\n\n")
+        f.write("Best Parameters:\n")
+        f.write(f"  start_t: {best_result['start_t']}\n")
+        f.write(f"  t_purify: {best_result['t_purify']}\n")
+        f.write(f"  Clean accuracy (with DDPM): {best_result['clean_purified_acc']:.4f}\n")
+        f.write(f"  Adversarial accuracy (with DDPM): {best_result['adv_purified_acc']:.4f}\n")
+        f.write(f"  Harmonic mean: {best_result['harmonic_mean']:.4f}\n\n")
+        f.write("All Results:\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"{'start_t':>8} {'t_purify':>8} {'Clean':>8} {'Adv':>8} {'HMean':>8}\n")
+        f.write("-" * 70 + "\n")
+        for r in sorted_results:
+            f.write(f"{r['start_t']:>8} {r['t_purify']:>8} {r['clean_purified_acc']:>8.4f} {r['adv_purified_acc']:>8.4f} {r['harmonic_mean']:>8.4f}\n")
     
     print(f"\nResults saved to {log_dir}")
-    print(f"Text results: {os.path.join(log_dir, 'results.txt')}")
 
 
 if __name__ == '__main__':

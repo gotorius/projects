@@ -90,14 +90,17 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 
 # ========== 正規化ラッパー ==========
 class NormalizedClassifier(nn.Module):
-    def __init__(self, classifier, mean, std, device):
+    def __init__(self, classifier, mean, std):
         super().__init__()
         self.classifier = classifier
-        self.mean = torch.tensor(mean, device=device).view(1, 3, 1, 1)
-        self.std = torch.tensor(std, device=device).view(1, 3, 1, 1)
+        self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
     
     def forward(self, x):
-        x_norm = (x - self.mean) / self.std
+        # 入力のデバイスに合わせて正規化パラメータを移動
+        mean = self.mean.to(x.device)
+        std = self.std.to(x.device)
+        x_norm = (x - mean) / std
         return self.classifier(x_norm)
 
 
@@ -541,7 +544,7 @@ def main():
         t_purify=args.t_purify, start_t=args.start_t, eta=args.eta
     )
     
-    normalized_classifier = NormalizedClassifier(classifier, IMAGENET_MEAN, IMAGENET_STD, device)
+    normalized_classifier = NormalizedClassifier(classifier, IMAGENET_MEAN, IMAGENET_STD).to(device)
     
     x_test, y_test, classes = load_cached_samples(args.cached_samples)
     
