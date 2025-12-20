@@ -41,21 +41,26 @@ def get_args():
                         default='/mnt/data1/gotou/projects/pcam/gan/checkpoints',
                         help='モデル保存先')
     parser.add_argument('--image_size', type=int, default=224, help='画像サイズ')
-    parser.add_argument('--batch_size', type=int, default=64, help='バッチサイズ')
+    parser.add_argument('--batch_size', type=int, default=128, help='バッチサイズ')
     parser.add_argument('--epochs', type=int, default=100, help='エポック数')
-    parser.add_argument('--lr_g', type=float, default=2e-4, help='Generatorの学習率')
-    parser.add_argument('--lr_d', type=float, default=2e-4, help='Discriminatorの学習率')
+    parser.add_argument('--lr_g', type=float, default=1e-4, help='Generatorの学習率')
+    parser.add_argument('--lr_d', type=float, default=1e-4, help='Discriminatorの学習率')
     parser.add_argument('--latent_dim', type=int, default=128, help='潜在空間の次元')
     parser.add_argument('--ngf', type=int, default=64, help='Generator基本チャンネル数')
     parser.add_argument('--ndf', type=int, default=64, help='Discriminator基本チャンネル数')
-    parser.add_argument('--beta1', type=float, default=0.5, help='Adam beta1')
-    parser.add_argument('--beta2', type=float, default=0.999, help='Adam beta2')
+    parser.add_argument('--beta1', type=float, default=0.0, help='Adam beta1 (default=0 for WGAN)')
+    parser.add_argument('--beta2', type=float, default=0.9, help='Adam beta2 (default=0.9 for WGAN)')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoaderのworker数')
     parser.add_argument('--resume', type=str, default=None, help='再開するチェックポイント')
     parser.add_argument('--seed', type=int, default=42, help='乱数シード')
     parser.add_argument('--save_every', type=int, default=10, help='保存間隔(epochs)')
     parser.add_argument('--gpu_id', type=int, default=0, help='使用するGPU ID')
-    parser.add_argument('--n_critic', type=int, default=1, help='Discriminator更新回数/Generator更新')
+    parser.add_argument('--n_critic', type=int, default=5, help='Discriminator更新回数/Generator更新')
+    parser.add_argument('--gp_weight', type=float, default=10.0, help='Gradient penalty重み')
+    parser.add_argument('--gan_type', type=str, default='wgan-gp', choices=['wgan-gp', 'dcgan'],
+                        help='GAN訓練方式 (wgan-gp推奨)')
+    parser.add_argument('--use_wgan', action='store_true', default=True, 
+                        help='WGAN-GPを使用 (推奨)')
     return parser.parse_args()
 
 
@@ -334,18 +339,14 @@ def train(args):
     generator = Generator(latent_dim=args.latent_dim, ngf=args.ngf).to(device)
     print(f'Generator parameters: {sum(p.numel() for p in generator.parameters()):,}')
     
-    print(f'Building Discriminator (ndf={args.ndf})')
-    discriminator = Discriminator(ndf=args.ndf).to(device)
+    # WGAN-GPの場合はWGANDiscriminatorを使用
+    print(f'Building Discriminator (ndf={args.ndf}) - WGAN-GP mode')
+    discriminator = WGANDiscriminator(ndf=args.ndf).to(device)
     print(f'Discriminator parameters: {sum(p.numel() for p in discriminator.parameters()):,}')
     
-    # Loss and Optimizers
-    criterion = nn.BCELoss()
+    # Optimizers (WGAN-GPにはAdamを使用、beta1=0が重要)
     optimizer_g = torch.optim.Adam(generator.parameters(), lr=args.lr_g, betas=(args.beta1, args.beta2))
     optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=args.lr_d, betas=(args.beta1, args.beta2))
-    
-    # Labels
-    real_label = 1.0
-    fake_label = 0.0
     
     # Resume
     start_epoch = 0
@@ -371,68 +372,87 @@ def train(args):
     print(f'Batch size: {args.batch_size}, Image size: {args.image_size}')
     print(f'LR_G: {args.lr_g}, LR_D: {args.lr_d}')
     
+    # Wasserstein距離を追跡
+    wasserstein_distances = []
+    
     for epoch in range(start_epoch, args.epochs):
         generator.train()
         discriminator.train()
         
         running_g_loss = 0.0
         running_d_loss = 0.0
+        running_wd = 0.0
+        running_gp = 0.0
+        n_g_updates = 0
         
         pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{args.epochs}')
         for batch_idx, (real_images, _) in enumerate(pbar):
             batch_size = real_images.size(0)
             real_images = real_images.to(device)
             
-            # Labels
-            label_real = torch.full((batch_size, 1), real_label, dtype=torch.float, device=device)
-            label_fake = torch.full((batch_size, 1), fake_label, dtype=torch.float, device=device)
+            # ========== Train Discriminator (Critic) ==========
+            discriminator.zero_grad()
             
-            # ========== Train Discriminator ==========
-            for _ in range(args.n_critic):
-                discriminator.zero_grad()
-                
-                # Real images
-                output_real = discriminator(real_images)
-                d_loss_real = criterion(output_real, label_real)
-                
-                # Fake images
-                noise = torch.randn(batch_size, args.latent_dim, device=device)
-                fake_images = generator(noise).detach()
-                output_fake = discriminator(fake_images)
-                d_loss_fake = criterion(output_fake, label_fake)
-                
-                # Total D loss
-                d_loss = d_loss_real + d_loss_fake
-                d_loss.backward()
-                optimizer_d.step()
+            # Real images score
+            d_real = discriminator(real_images)
+            
+            # Generate fake images
+            noise = torch.randn(batch_size, args.latent_dim, device=device)
+            fake_images = generator(noise).detach()
+            
+            # Fake images score  
+            d_fake = discriminator(fake_images)
+            
+            # Gradient penalty
+            gp = compute_gradient_penalty(discriminator, real_images, fake_images, device)
+            
+            # Wasserstein distance (D(real) - D(fake))
+            wasserstein_dist = d_real.mean() - d_fake.mean()
+            
+            # WGAN-GP loss: minimize -wasserstein_dist + lambda * gp
+            d_loss = -wasserstein_dist + args.gp_weight * gp
+            
+            d_loss.backward()
+            optimizer_d.step()
+            
+            running_d_loss += d_loss.item()
+            running_wd += wasserstein_dist.item()
+            running_gp += gp.item()
+            d_losses.append(d_loss.item())
+            wasserstein_distances.append(wasserstein_dist.item())
             
             # ========== Train Generator ==========
-            generator.zero_grad()
+            # Generator is updated every n_critic iterations
+            if (batch_idx + 1) % args.n_critic == 0:
+                generator.zero_grad()
+                
+                noise = torch.randn(batch_size, args.latent_dim, device=device)
+                fake_images = generator(noise)
+                
+                # Generator wants to maximize D(fake) = minimize -D(fake)
+                g_loss = -discriminator(fake_images).mean()
+                
+                g_loss.backward()
+                optimizer_g.step()
+                
+                running_g_loss += g_loss.item()
+                n_g_updates += 1
+                g_losses.append(g_loss.item())
             
-            noise = torch.randn(batch_size, args.latent_dim, device=device)
-            fake_images = generator(noise)
-            output_fake = discriminator(fake_images)
-            
-            # Generator wants discriminator to classify fake as real
-            g_loss = criterion(output_fake, label_real)
-            g_loss.backward()
-            optimizer_g.step()
-            
-            # Record
-            g_losses.append(g_loss.item())
-            d_losses.append(d_loss.item())
-            running_g_loss += g_loss.item()
-            running_d_loss += d_loss.item()
-            
+            # Update progress bar
             pbar.set_postfix({
-                'G_loss': f'{g_loss.item():.4f}',
-                'D_loss': f'{d_loss.item():.4f}'
+                'G_loss': f'{running_g_loss / max(1, n_g_updates):.4f}',
+                'D_loss': f'{d_loss.item():.4f}',
+                'W_dist': f'{wasserstein_dist.item():.4f}',
+                'GP': f'{gp.item():.4f}'
             })
         
         # Epoch stats
-        avg_g_loss = running_g_loss / len(dataloader)
+        avg_g_loss = running_g_loss / max(1, n_g_updates)
         avg_d_loss = running_d_loss / len(dataloader)
-        print(f'Epoch {epoch+1} | G Loss: {avg_g_loss:.6f} | D Loss: {avg_d_loss:.6f}')
+        avg_wd = running_wd / len(dataloader)
+        avg_gp = running_gp / len(dataloader)
+        print(f'Epoch {epoch+1} | G Loss: {avg_g_loss:.4f} | D Loss: {avg_d_loss:.4f} | W_dist: {avg_wd:.4f} | GP: {avg_gp:.4f}')
         
         # Save checkpoint and samples
         if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
@@ -446,6 +466,7 @@ def train(args):
                 'optimizer_d_state_dict': optimizer_d.state_dict(),
                 'g_losses': g_losses,
                 'd_losses': d_losses,
+                'wasserstein_distances': wasserstein_distances,
                 'args': vars(args),
             }, ckpt_path)
             print(f'Checkpoint saved: {ckpt_path}')
@@ -472,6 +493,7 @@ def train(args):
         'optimizer_d_state_dict': optimizer_d.state_dict(),
         'g_losses': g_losses,
         'd_losses': d_losses,
+        'wasserstein_distances': wasserstein_distances,
         'args': vars(args),
     }, best_path)
     print(f'Best model saved: {best_path}')
@@ -497,6 +519,7 @@ def train(args):
     history = {
         'g_losses': g_losses,
         'd_losses': d_losses,
+        'wasserstein_distances': wasserstein_distances,
         'args': vars(args)
     }
     with open(os.path.join(args.save_dir, 'training_history.json'), 'w') as f:
@@ -504,8 +527,9 @@ def train(args):
     
     print(f'\n{"="*60}')
     print('Training completed!')
-    print(f'Final G Loss: {avg_g_loss:.6f}')
-    print(f'Final D Loss: {avg_d_loss:.6f}')
+    print(f'Final G Loss: {avg_g_loss:.4f}')
+    print(f'Final D Loss: {avg_d_loss:.4f}')
+    print(f'Final Wasserstein Distance: {avg_wd:.4f}')
     print(f'Models saved to: {args.save_dir}')
     print(f'Samples saved to: {samples_dir}')
     print(f'{"="*60}')
