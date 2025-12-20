@@ -41,7 +41,7 @@ def parse_args():
                         help='FGSM perturbation epsilon')
     
     # 拡散モデル浄化設定
-    parser.add_argument('--start_t', type=int, default=80,
+    parser.add_argument('--start_t', type=int, default=50,
                         help='Diffusion start timestep')
     parser.add_argument('--t_purify', type=int, default=50,
                         help='Number of purification steps')

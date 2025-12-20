@@ -51,9 +51,9 @@ def parse_args():
                         help='Perturbation norm')
     
     # DDPM浄化設定
-    parser.add_argument('--t_purify', type=int, default=50,
+    parser.add_argument('--t_purify', type=int, default=70,
                         help='Number of diffusion steps for purification')
-    parser.add_argument('--start_t', type=int, default=80,
+    parser.add_argument('--start_t', type=int, default=130,
                         help='Starting timestep for reverse diffusion')
     parser.add_argument('--eta', type=float, default=0.0,
                         help='Stochasticity parameter for DDIM')

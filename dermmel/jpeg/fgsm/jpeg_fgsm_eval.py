@@ -35,7 +35,7 @@ def parse_args():
                         help='FGSM perturbation epsilon')
     
     # JPEG圧縮設定
-    parser.add_argument('--quality', type=int, default=11,
+    parser.add_argument('--quality', type=int, default=1,
                         help='JPEG compression quality (1-100)')
     
     # パス設定
@@ -52,7 +52,7 @@ def parse_args():
     # 実行設定
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size for evaluation')
-    parser.add_argument('--gpu', type=int, default=2,
+    parser.add_argument('--gpu', type=int, default=1,
                         help='GPU ID')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')

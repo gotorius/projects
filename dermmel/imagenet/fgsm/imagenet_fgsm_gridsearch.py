@@ -1,0 +1,597 @@
+"""
+ImageNet FGSM Attack + Guided-Diffusion Defense - Grid Search
+
+start_t と t_purify のパラメータをグリッドサーチして最適な防御性能を探索
+
+実行例:
+python imagenet_fgsm_gridsearch.py --epsilon 0.031 --gpu 0
+"""
+
+import os
+import sys
+import argparse
+import time
+import json
+from datetime import datetime
+from pathlib import Path
+import itertools
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+from torchvision.utils import save_image, make_grid
+import numpy as np
+from tqdm.auto import tqdm
+import pandas as pd
+
+# Guided-diffusionモジュールのインポート
+sys.path.insert(0, '/mnt/data1/gotou/kaggle/guided-diffusion')
+from guided_diffusion.script_util import (
+    model_and_diffusion_defaults,
+    create_model_and_diffusion,
+)
+
+
+# ========== 引数パーサー ==========
+def parse_args():
+    parser = argparse.ArgumentParser(description='ImageNet FGSM + Guided-Diffusion Grid Search')
+    
+    # 攻撃設定
+    parser.add_argument('--epsilon', type=float, default=8/255,
+                        help='FGSM perturbation epsilon')
+    
+    # グリッドサーチ設定
+    parser.add_argument('--start_t_list', type=int, nargs='+', 
+                        default=[50, 80, 100, 130, 150, 180, 200],
+                        help='List of start_t values to search')
+    parser.add_argument('--t_purify_list', type=int, nargs='+',
+                        default=[30, 50, 70, 100, 130, 150],
+                        help='List of t_purify values to search')
+    parser.add_argument('--eta', type=float, default=0.0,
+                        help='DDIM sampling eta (0=deterministic)')
+    
+    # データ設定
+    parser.add_argument('--n_samples_per_class', type=int, default=25,
+                        help='Number of samples per class for grid search')
+    
+    # パス設定
+    parser.add_argument('--cached_samples', type=str,
+                        default='/mnt/data1/gotou/projects/dermmel/ddpm/correct_samples_balanced_500.pt',
+                        help='Path to cached correct samples')
+    parser.add_argument('--diffusion_ckpt', type=str,
+                        default='/mnt/data1/gotou/kaggle/guided-diffusion/256x256_diffusion_uncond.pt',
+                        help='Guided-Diffusion checkpoint path')
+    parser.add_argument('--clf_ckpt', type=str,
+                        default='/mnt/data1/gotou/projects/dermmel/resnet/resnet50_best.pth',
+                        help='Classifier checkpoint path')
+    parser.add_argument('--output_dir', type=str,
+                        default='/mnt/data1/gotou/projects/dermmel/imagenet/fgsm/gridsearch_results',
+                        help='Output directory')
+    
+    # 実行設定
+    parser.add_argument('--batch_size', type=int, default=8,
+                        help='Batch size for evaluation')
+    parser.add_argument('--gpu', type=int, default=0,
+                        help='GPU ID')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed')
+    
+    return parser.parse_args()
+
+
+# ========== 定数 ==========
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+# ========== Guided-Diffusion浄化クラス ==========
+class GuidedDiffusionPurifier(nn.Module):
+    """Guided-Diffusion (ImageNet Pretrained) による浄化"""
+    def __init__(self, diffusion_model, diffusion, device, start_t=80, t_purify=50, eta=0.0):
+        super().__init__()
+        self.model = diffusion_model
+        self.diffusion = diffusion
+        self.device = device
+        self.start_t = start_t
+        self.t_purify = t_purify
+        self.eta = eta
+    
+    def update_params(self, start_t, t_purify):
+        """パラメータを更新"""
+        self.start_t = start_t
+        self.t_purify = t_purify
+    
+    @torch.no_grad()
+    def forward(self, x):
+        """
+        x: (B, 3, H, W), [0, 1]
+        return: purified image (B, 3, H, W), [0, 1]
+        """
+        b = x.size(0)
+        original_size = x.shape[-2:]
+        
+        # 256x256にリサイズ（Guided-Diffusionの入力サイズ）
+        if original_size != (256, 256):
+            x = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
+        
+        # [0,1] → [-1,1]
+        x_diff = x * 2.0 - 1.0
+        
+        # Forward diffusion to start_t
+        t = torch.full((b,), self.start_t, device=self.device, dtype=torch.long)
+        noise = torch.randn_like(x_diff)
+        x_t = self.diffusion.q_sample(x_diff, t, noise=noise)
+        
+        # Reverse diffusion
+        end_t = max(self.start_t - self.t_purify, 0)
+        indices = list(range(self.start_t, end_t, -1))
+        
+        for i in indices:
+            t = torch.full((b,), i, device=self.device, dtype=torch.long)
+            
+            # モデル予測
+            out = self.diffusion.p_mean_variance(
+                self.model, x_t, t,
+                clip_denoised=True,
+                denoised_fn=None,
+                model_kwargs={}
+            )
+            
+            # DDIM step
+            if i > 0:
+                nonzero_mask = (t != 0).float().view(-1, 1, 1, 1)
+                x_t = out["mean"] + nonzero_mask * (self.eta * torch.sqrt(out["variance"])) * torch.randn_like(x_t)
+            else:
+                x_t = out["mean"]
+        
+        x_purified = torch.clamp(x_t, -1.0, 1.0)
+        
+        # [-1,1] → [0,1]
+        x_purified = (x_purified + 1.0) / 2.0
+        
+        # 元のサイズに戻す
+        if original_size != (256, 256):
+            x_purified = F.interpolate(x_purified, size=original_size, mode='bilinear', align_corners=False)
+        
+        return torch.clamp(x_purified, 0, 1)
+
+
+# ========== モデル読み込み ==========
+def load_classifier(args, device):
+    """分類器を読み込み (DermMel用 - Dropoutなし)"""
+    classifier = models.resnet50(weights=None)
+    num_features = classifier.fc.in_features
+    classifier.fc = nn.Linear(num_features, 2)  # DermMel: 2クラス
+    
+    checkpoint = torch.load(args.clf_ckpt, map_location=device)
+    if 'model_state_dict' in checkpoint:
+        classifier.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        classifier.load_state_dict(checkpoint)
+    
+    classifier = classifier.to(device).eval()
+    print(f"Loaded classifier from {args.clf_ckpt}")
+    
+    return classifier
+
+
+def load_guided_diffusion(args, device):
+    """Guided-Diffusionモデルを読み込み"""
+    print("\nLoading Guided-Diffusion model (ImageNet pretrained)...")
+    
+    # 256x256 ImageNet unconditionalモデルの設定
+    model_config = {
+        'attention_resolutions': '32,16,8',
+        'class_cond': False,
+        'diffusion_steps': 1000,
+        'image_size': 256,
+        'learn_sigma': True,
+        'noise_schedule': 'linear',
+        'num_channels': 256,
+        'num_head_channels': 64,
+        'num_res_blocks': 2,
+        'resblock_updown': True,
+        'use_fp16': False,
+        'use_scale_shift_norm': True,
+    }
+    
+    # モデルと拡散プロセスを作成
+    diffusion_model, diffusion = create_model_and_diffusion(
+        **model_config,
+        timestep_respacing='',
+        use_kl=False,
+        predict_xstart=False,
+        rescale_timesteps=False,
+        rescale_learned_sigmas=False,
+        use_checkpoint=False,
+        use_new_attention_order=False,
+        dropout=0.0,
+        channel_mult='',
+        num_heads=4,
+        num_heads_upsample=-1,
+    )
+    
+    # チェックポイントのロード
+    state_dict = torch.load(args.diffusion_ckpt, map_location=device)
+    diffusion_model.load_state_dict(state_dict)
+    diffusion_model.to(device)
+    diffusion_model.eval()
+    
+    print(f"Loaded Guided-Diffusion model from {args.diffusion_ckpt}")
+    
+    return diffusion_model, diffusion
+
+
+# ========== データ読み込み ==========
+def load_cached_samples(path, n_samples_per_class):
+    """キャッシュされたサンプルを読み込み（クラスごとにn_samples_per_class枚）"""
+    data = torch.load(path, map_location='cpu')
+    x_test = data['x_test']
+    y_test = data['y_test']
+    classes = data['classes']
+    
+    # クラスごとにn_samples_per_class枚ずつ取得
+    class_indices = {}
+    for i, label in enumerate(y_test):
+        label_val = label.item()
+        if label_val not in class_indices:
+            class_indices[label_val] = []
+        class_indices[label_val].append(i)
+    
+    selected_indices = []
+    for label in sorted(class_indices.keys()):
+        indices = class_indices[label][:n_samples_per_class]
+        selected_indices.extend(indices)
+    
+    x_subset = x_test[selected_indices]
+    y_subset = y_test[selected_indices]
+    
+    print(f"Loaded {len(x_subset)} samples from {path}")
+    print(f"  {n_samples_per_class} samples per class, Classes: {classes}")
+    
+    return x_subset, y_subset, classes
+
+
+# ========== FGSM攻撃 ==========
+def fgsm_attack(model, x, y, epsilon, device):
+    """FGSM攻撃"""
+    x = x.clone().to(device)
+    x.requires_grad = True
+    
+    mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
+    x_norm = (x - mean) / std
+    
+    outputs = model(x_norm)
+    loss = F.cross_entropy(outputs, y.to(device))
+    loss.backward()
+    
+    x_adv = x + epsilon * x.grad.sign()
+    x_adv = torch.clamp(x_adv, 0, 1)
+    
+    return x_adv.detach()
+
+
+# ========== 評価関数 ==========
+def evaluate(model, x_test, y_test, device, batch_size=16):
+    """精度を計算"""
+    model.eval()
+    correct = 0
+    total = 0
+    
+    mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
+    
+    with torch.no_grad():
+        for i in range(0, len(x_test), batch_size):
+            x_batch = x_test[i:i+batch_size].to(device)
+            y_batch = y_test[i:i+batch_size].to(device)
+            
+            x_norm = (x_batch - mean) / std
+            outputs = model(x_norm)
+            _, predicted = outputs.max(1)
+            
+            correct += (predicted == y_batch).sum().item()
+            total += y_batch.size(0)
+    
+    return correct / total
+
+
+def evaluate_with_purification(purifier, classifier, x_test, y_test, device, batch_size=8):
+    """拡散浄化後の精度を計算"""
+    classifier.eval()
+    
+    correct = 0
+    total = 0
+    
+    mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
+    
+    with torch.no_grad():
+        for i in range(0, len(x_test), batch_size):
+            x_batch = x_test[i:i+batch_size].to(device)
+            y_batch = y_test[i:i+batch_size].to(device)
+            
+            # 浄化
+            x_purified = purifier(x_batch)
+            
+            # 分類
+            x_norm = (x_purified - mean) / std
+            outputs = classifier(x_norm)
+            _, predicted = outputs.max(1)
+            
+            correct += (predicted == y_batch).sum().item()
+            total += y_batch.size(0)
+    
+    return correct / total
+
+
+# ========== グリッドサーチ ==========
+def run_grid_search(args, classifier, purifier, x_test, y_test, x_adv, device, log_file):
+    """グリッドサーチを実行"""
+    
+    results = []
+    param_combinations = list(itertools.product(args.start_t_list, args.t_purify_list))
+    total_combinations = len(param_combinations)
+    
+    # ベースライン（防御なし）
+    clean_acc = evaluate(classifier, x_test, y_test, device, args.batch_size)
+    adv_acc_no_defense = evaluate(classifier, x_adv, y_test, device, args.batch_size)
+    
+    log_file.write(f"Baseline Results:\n")
+    log_file.write(f"  Clean accuracy (no defense): {clean_acc:.4f}\n")
+    log_file.write(f"  Adversarial accuracy (no defense): {adv_acc_no_defense:.4f}\n")
+    log_file.write(f"\n{'='*80}\n")
+    log_file.write(f"Grid Search Results:\n")
+    log_file.write(f"{'='*80}\n\n")
+    log_file.flush()
+    
+    print(f"\nBaseline Results:")
+    print(f"  Clean accuracy (no defense): {clean_acc:.4f}")
+    print(f"  Adversarial accuracy (no defense): {adv_acc_no_defense:.4f}")
+    print(f"\nStarting grid search over {total_combinations} combinations...")
+    
+    best_result = None
+    best_defense_score = -float('inf')
+    
+    pbar = tqdm(param_combinations, desc="Grid Search")
+    
+    for start_t, t_purify in pbar:
+        # t_purifyがstart_tを超えないように（意味のない組み合わせをスキップ）
+        if t_purify > start_t:
+            continue
+        
+        # パラメータを更新
+        purifier.update_params(start_t, t_purify)
+        
+        start_time = time.time()
+        
+        # クリーン画像の浄化評価
+        clean_purified_acc = evaluate_with_purification(
+            purifier, classifier, x_test, y_test, device, args.batch_size
+        )
+        
+        # 敵対的画像の浄化評価
+        adv_purified_acc = evaluate_with_purification(
+            purifier, classifier, x_adv, y_test, device, args.batch_size
+        )
+        
+        elapsed_time = time.time() - start_time
+        
+        # 防御改善度
+        defense_improvement = adv_purified_acc - adv_acc_no_defense
+        
+        # クリーン精度の低下
+        clean_drop = clean_acc - clean_purified_acc
+        
+        # 防御スコア（敵対的精度 - クリーン精度低下のペナルティ）
+        # クリーン精度の低下を考慮した総合スコア
+        defense_score = adv_purified_acc - 0.5 * max(0, clean_drop)
+        
+        result = {
+            'start_t': start_t,
+            't_purify': t_purify,
+            'clean_acc': clean_acc,
+            'clean_purified_acc': clean_purified_acc,
+            'clean_drop': clean_drop,
+            'adv_acc_no_defense': adv_acc_no_defense,
+            'adv_purified_acc': adv_purified_acc,
+            'defense_improvement': defense_improvement,
+            'defense_score': defense_score,
+            'time': elapsed_time
+        }
+        results.append(result)
+        
+        # ベスト更新チェック
+        if defense_score > best_defense_score:
+            best_defense_score = defense_score
+            best_result = result.copy()
+        
+        # プログレスバー更新
+        pbar.set_postfix({
+            'start_t': start_t,
+            't_purify': t_purify,
+            'adv_acc': f'{adv_purified_acc:.3f}',
+            'best': f'{best_defense_score:.3f}'
+        })
+        
+        # ログ出力
+        log_line = (f"start_t={start_t:3d}, t_purify={t_purify:3d} | "
+                   f"Clean: {clean_purified_acc:.4f} (drop: {clean_drop:+.4f}) | "
+                   f"Adv: {adv_purified_acc:.4f} (imp: {defense_improvement:+.4f}) | "
+                   f"Score: {defense_score:.4f} | Time: {elapsed_time:.1f}s")
+        log_file.write(log_line + '\n')
+        log_file.flush()
+    
+    return results, best_result, clean_acc, adv_acc_no_defense
+
+
+# ========== メイン ==========
+def main():
+    args = parse_args()
+    
+    # シード設定
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+    
+    # デバイス
+    device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # 出力ディレクトリ (MMDDHHMM形式)
+    timestamp = datetime.now().strftime("%m%d%H%M")
+    log_dir = os.path.join(args.output_dir, timestamp)
+    os.makedirs(log_dir, exist_ok=True)
+    print(f"Output directory: {log_dir}")
+    
+    # 結果ファイル
+    log_file = open(os.path.join(log_dir, 'gridsearch_log.txt'), 'w')
+    
+    # ヘッダー出力
+    header = f"""
+{'='*80}
+ImageNet FGSM Attack + Guided-Diffusion Defense - Grid Search
+{'='*80}
+Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)
+Samples: {args.n_samples_per_class} per class (total: {args.n_samples_per_class * 2})
+Grid Search Parameters:
+  start_t: {args.start_t_list}
+  t_purify: {args.t_purify_list}
+  eta: {args.eta}
+{'='*80}
+"""
+    print(header)
+    log_file.write(header + '\n')
+    
+    # モデル読み込み
+    classifier = load_classifier(args, device)
+    diffusion_model, diffusion = load_guided_diffusion(args, device)
+    
+    # 浄化器作成（初期値は後で更新される）
+    purifier = GuidedDiffusionPurifier(
+        diffusion_model, diffusion, device,
+        start_t=100, t_purify=50, eta=args.eta
+    )
+    
+    # データ読み込み
+    x_test, y_test, classes = load_cached_samples(args.cached_samples, args.n_samples_per_class)
+    
+    # FGSM攻撃を事前に実行
+    print("\nGenerating adversarial examples with FGSM...")
+    x_adv_list = []
+    for i in tqdm(range(0, len(x_test), args.batch_size), desc="FGSM Attack"):
+        x_batch = x_test[i:i+args.batch_size]
+        y_batch = y_test[i:i+args.batch_size]
+        x_adv_batch = fgsm_attack(classifier, x_batch, y_batch, args.epsilon, device)
+        x_adv_list.append(x_adv_batch.cpu())
+    x_adv = torch.cat(x_adv_list, dim=0)
+    
+    # グリッドサーチ実行
+    results, best_result, clean_acc, adv_acc_no_defense = run_grid_search(
+        args, classifier, purifier, x_test, y_test, x_adv, device, log_file
+    )
+    
+    # 結果の集計
+    print(f"\n{'='*80}")
+    print("GRID SEARCH COMPLETED")
+    print(f"{'='*80}")
+    
+    # DataFrameに変換してソート
+    df = pd.DataFrame(results)
+    df_sorted = df.sort_values('defense_score', ascending=False)
+    
+    # Top 10結果を表示
+    print("\nTop 10 Results (by defense score):")
+    print("-" * 100)
+    print(f"{'Rank':<5} {'start_t':<8} {'t_purify':<9} {'Clean_Pur':<10} {'Adv_Pur':<10} {'Improvement':<12} {'Score':<10}")
+    print("-" * 100)
+    
+    log_file.write(f"\n{'='*80}\n")
+    log_file.write("Top 10 Results (by defense score):\n")
+    log_file.write("-" * 100 + '\n')
+    log_file.write(f"{'Rank':<5} {'start_t':<8} {'t_purify':<9} {'Clean_Pur':<10} {'Adv_Pur':<10} {'Improvement':<12} {'Score':<10}\n")
+    log_file.write("-" * 100 + '\n')
+    
+    for rank, (_, row) in enumerate(df_sorted.head(10).iterrows(), 1):
+        line = (f"{rank:<5} {row['start_t']:<8} {row['t_purify']:<9} "
+               f"{row['clean_purified_acc']:<10.4f} {row['adv_purified_acc']:<10.4f} "
+               f"{row['defense_improvement']:<+12.4f} {row['defense_score']:<10.4f}")
+        print(line)
+        log_file.write(line + '\n')
+    
+    # ベスト結果
+    print(f"\n{'='*80}")
+    print("BEST PARAMETERS")
+    print(f"{'='*80}")
+    best_summary = f"""
+Best Parameters:
+  start_t:    {best_result['start_t']}
+  t_purify:   {best_result['t_purify']}
+
+Performance:
+  Clean accuracy (no defense):      {clean_acc:.4f}
+  Clean accuracy (with defense):    {best_result['clean_purified_acc']:.4f}
+  Clean accuracy drop:              {best_result['clean_drop']:+.4f}
+  
+  Adversarial accuracy (no defense): {adv_acc_no_defense:.4f}
+  Adversarial accuracy (with defense): {best_result['adv_purified_acc']:.4f}
+  Defense improvement:              {best_result['defense_improvement']:+.4f}
+  
+  Defense score:                    {best_result['defense_score']:.4f}
+"""
+    print(best_summary)
+    log_file.write(f"\n{'='*80}\n")
+    log_file.write("BEST PARAMETERS\n")
+    log_file.write(f"{'='*80}\n")
+    log_file.write(best_summary)
+    
+    log_file.close()
+    
+    # CSV保存
+    csv_path = os.path.join(log_dir, 'gridsearch_results.csv')
+    df_sorted.to_csv(csv_path, index=False)
+    print(f"\nResults saved to CSV: {csv_path}")
+    
+    # JSON保存
+    results_json = {
+        'config': vars(args),
+        'baseline': {
+            'clean_acc': clean_acc,
+            'adv_acc_no_defense': adv_acc_no_defense
+        },
+        'best_result': best_result,
+        'all_results': results
+    }
+    
+    json_path = os.path.join(log_dir, 'gridsearch_results.json')
+    with open(json_path, 'w') as f:
+        json.dump(results_json, f, indent=2)
+    print(f"Results saved to JSON: {json_path}")
+    
+    # 推奨コマンドを出力
+    print(f"\n{'='*80}")
+    print("RECOMMENDED COMMAND")
+    print(f"{'='*80}")
+    recommended_cmd = (f"python imagenet_fgsm_eval.py "
+                      f"--epsilon {args.epsilon} "
+                      f"--start_t {best_result['start_t']} "
+                      f"--t_purify {best_result['t_purify']} "
+                      f"--gpu {args.gpu}")
+    print(recommended_cmd)
+    
+    log_file_path = os.path.join(log_dir, 'gridsearch_log.txt')
+    with open(log_file_path, 'a') as f:
+        f.write(f"\n{'='*80}\n")
+        f.write("RECOMMENDED COMMAND\n")
+        f.write(f"{'='*80}\n")
+        f.write(recommended_cmd + '\n')
+    
+    print(f"\nAll results saved to: {log_dir}")
+
+
+if __name__ == '__main__':
+    main()

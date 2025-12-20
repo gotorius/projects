@@ -47,7 +47,7 @@ def parse_args():
                         help='Use random start for PGD')
     
     # 拡散モデル浄化設定
-    parser.add_argument('--start_t', type=int, default=80,
+    parser.add_argument('--start_t', type=int, default=50,
                         help='Diffusion start timestep')
     parser.add_argument('--t_purify', type=int, default=50,
                         help='Number of purification steps')
@@ -71,7 +71,7 @@ def parse_args():
     # 実行設定
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for evaluation')
-    parser.add_argument('--gpu', type=int, default=0,
+    parser.add_argument('--gpu', type=int, default=2,
                         help='GPU ID')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')

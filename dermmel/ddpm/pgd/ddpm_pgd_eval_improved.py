@@ -44,9 +44,9 @@ def parse_args():
                         help='Random start for PGD')
     
     # DDPM浄化設定
-    parser.add_argument('--t_purify', type=int, default=50,
+    parser.add_argument('--t_purify', type=int, default=70,
                         help='Number of diffusion steps for purification')
-    parser.add_argument('--start_t', type=int, default=80,
+    parser.add_argument('--start_t', type=int, default=130,
                         help='Starting timestep for reverse diffusion')
     parser.add_argument('--eta', type=float, default=0.0,
                         help='Stochasticity parameter for DDIM')
@@ -68,7 +68,7 @@ def parse_args():
     # 実行設定
     parser.add_argument('--batch_size', type=int, default=16,
                         help='Batch size for evaluation')
-    parser.add_argument('--gpu', type=int, default=1,
+    parser.add_argument('--gpu', type=int, default=0,
                         help='GPU ID')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
