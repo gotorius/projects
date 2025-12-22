@@ -43,8 +43,8 @@ def get_args():
     parser.add_argument('--image_size', type=int, default=224, help='画像サイズ')
     parser.add_argument('--batch_size', type=int, default=128, help='バッチサイズ')
     parser.add_argument('--epochs', type=int, default=100, help='エポック数')
-    parser.add_argument('--lr_g', type=float, default=1e-4, help='Generatorの学習率')
-    parser.add_argument('--lr_d', type=float, default=1e-4, help='Discriminatorの学習率')
+    parser.add_argument('--lr_g', type=float, default=1e-5, help='Generatorの学習率')
+    parser.add_argument('--lr_d', type=float, default=1e-5, help='Discriminatorの学習率')
     parser.add_argument('--latent_dim', type=int, default=128, help='潜在空間の次元')
     parser.add_argument('--ngf', type=int, default=64, help='Generator基本チャンネル数')
     parser.add_argument('--ndf', type=int, default=64, help='Discriminator基本チャンネル数')
@@ -179,41 +179,38 @@ class Discriminator(nn.Module):
         return self.main(x).view(-1, 1)
 
 
-# ========== WGAN-GP (optional, better stability) ==========
+# ========== WGAN-GP with Spectral Normalization ==========
 class WGANDiscriminator(nn.Module):
     """
-    WGAN-GP Discriminator (no sigmoid, no BatchNorm)
+    WGAN-GP Discriminator with Spectral Normalization for stable training
     """
     def __init__(self, ndf=64, nc=3):
         super().__init__()
         
+        # Spectral Normalization で出力スケールを安定化
         self.main = nn.Sequential(
             # 224x224 -> 112x112
-            nn.Conv2d(nc, ndf, 4, 2, 1, bias=True),
+            nn.utils.spectral_norm(nn.Conv2d(nc, ndf, 4, 2, 1, bias=True)),
             nn.LeakyReLU(0.2, inplace=True),
             
             # 112x112 -> 56x56
-            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=True),
-            nn.LayerNorm([ndf * 2, 56, 56]),
+            nn.utils.spectral_norm(nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=True)),
             nn.LeakyReLU(0.2, inplace=True),
             
             # 56x56 -> 28x28
-            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=True),
-            nn.LayerNorm([ndf * 4, 28, 28]),
+            nn.utils.spectral_norm(nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=True)),
             nn.LeakyReLU(0.2, inplace=True),
             
             # 28x28 -> 14x14
-            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=True),
-            nn.LayerNorm([ndf * 8, 14, 14]),
+            nn.utils.spectral_norm(nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=True)),
             nn.LeakyReLU(0.2, inplace=True),
             
             # 14x14 -> 7x7
-            nn.Conv2d(ndf * 8, ndf * 16, 4, 2, 1, bias=True),
-            nn.LayerNorm([ndf * 16, 7, 7]),
+            nn.utils.spectral_norm(nn.Conv2d(ndf * 8, ndf * 16, 4, 2, 1, bias=True)),
             nn.LeakyReLU(0.2, inplace=True),
             
             # 7x7 -> 1x1
-            nn.Conv2d(ndf * 16, 1, 7, 1, 0, bias=True),
+            nn.utils.spectral_norm(nn.Conv2d(ndf * 16, 1, 7, 1, 0, bias=True)),
         )
         
         self._initialize_weights()
@@ -226,7 +223,7 @@ class WGANDiscriminator(nn.Module):
                     nn.init.constant_(m.bias.data, 0)
     
     def forward(self, x):
-        return self.main(x).view(-1, 1)
+        return self.main(x).view(-1)
 
 
 # ========== Gradient Penalty for WGAN-GP ==========
