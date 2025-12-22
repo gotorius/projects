@@ -65,7 +65,7 @@ def parse_args():
                         help='Output directory')
     
     # 実行設定
-    parser.add_argument('--batch_size', type=int, default=128,
+    parser.add_argument('--batch_size', type=int, default=64,
                         help='Batch size for evaluation')
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU ID')
