@@ -13,9 +13,15 @@ Reference:
     4. 段階的な学習率減衰
     5. Label smoothing とノイズ追加
     6. 適切なログ出力
+    7. 潜在次元を1024に拡張（高品質再構成のため）
 
 Usage:
-    python defense_gan_train_v2.py --epochs 100 --batch_size 64 --gpu_id 0
+    python defense_gan_train_v2.py --epochs 100 --batch_size 32 --gpu_id 0
+
+メモリ使用量目安 (latent_dim=1024):
+    - batch_size=32: ~6GB VRAM
+    - batch_size=64: ~10GB VRAM
+    - batch_size=16: ~4GB VRAM
 """
 
 import os
@@ -46,12 +52,12 @@ def get_args():
     parser.add_argument('--save_dir', type=str,
                         default='/mnt/data1/gotou/projects/pcam/gan/checkpoints_v2',
                         help='モデル保存先')
-    parser.add_argument('--image_size', type=int, default=96, help='画像サイズ (96推奨、224は不安定)')
-    parser.add_argument('--batch_size', type=int, default=64, help='バッチサイズ')
+    parser.add_argument('--image_size', type=int, default=224, help='画像サイズ (224対応)')
+    parser.add_argument('--batch_size', type=int, default=32, help='バッチサイズ (latent_dim=1024のため32推奨)')
     parser.add_argument('--epochs', type=int, default=100, help='エポック数')
     parser.add_argument('--lr_g', type=float, default=1e-4, help='Generatorの学習率')
     parser.add_argument('--lr_d', type=float, default=1e-4, help='Discriminatorの学習率')
-    parser.add_argument('--latent_dim', type=int, default=128, help='潜在空間の次元')
+    parser.add_argument('--latent_dim', type=int, default=1024, help='潜在空間の次元 (高品質再構成のため1024)')
     parser.add_argument('--ngf', type=int, default=64, help='Generator基本チャンネル数')
     parser.add_argument('--ndf', type=int, default=64, help='Discriminator基本チャンネル数')
     parser.add_argument('--beta1', type=float, default=0.0, help='Adam beta1')
@@ -84,13 +90,13 @@ def weights_init(m):
 # ========== Generator ==========
 class Generator(nn.Module):
     """
-    Generator for 96x96 RGB images
-    Structure: latent_dim -> 6x6 -> 12x12 -> 24x24 -> 48x48 -> 96x96
+    Generator for 224x224 RGB images
+    Structure: latent_dim -> 7x7 -> 14x14 -> 28x28 -> 56x56 -> 112x112 -> 224x224
     """
-    def __init__(self, latent_dim=128, ngf=64, nc=3):
+    def __init__(self, latent_dim=1024, ngf=64, nc=3):
         super().__init__()
         self.latent_dim = latent_dim
-        self.init_size = 6  # 96 = 6 * 2^4
+        self.init_size = 7  # 224 = 7 * 2^5
         
         self.fc = nn.Sequential(
             nn.Linear(latent_dim, ngf * 8 * self.init_size * self.init_size),
@@ -98,26 +104,31 @@ class Generator(nn.Module):
         )
         
         self.main = nn.Sequential(
-            # State: (ngf*8) x 6 x 6
+            # State: (ngf*8) x 7 x 7
             nn.BatchNorm2d(ngf * 8),
             
-            # 6x6 -> 12x12
+            # 7x7 -> 14x14
             nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
             nn.BatchNorm2d(ngf * 4),
             nn.ReLU(True),
             
-            # 12x12 -> 24x24
+            # 14x14 -> 28x28
             nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
             nn.BatchNorm2d(ngf * 2),
             nn.ReLU(True),
             
-            # 24x24 -> 48x48
+            # 28x28 -> 56x56
             nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),
             nn.BatchNorm2d(ngf),
             nn.ReLU(True),
             
-            # 48x48 -> 96x96
-            nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
+            # 56x56 -> 112x112
+            nn.ConvTranspose2d(ngf, ngf // 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf // 2),
+            nn.ReLU(True),
+            
+            # 112x112 -> 224x224
+            nn.ConvTranspose2d(ngf // 2, nc, 4, 2, 1, bias=False),
             nn.Tanh()
         )
         
@@ -132,41 +143,34 @@ class Generator(nn.Module):
 # ========== Discriminator (Critic for WGAN-GP) ==========
 class Discriminator(nn.Module):
     """
-    WGAN-GP Discriminator (Critic) for 96x96 RGB images
-    Structure: 96x96 -> 48x48 -> 24x24 -> 12x12 -> 6x6 -> 1
+    WGAN-GP Discriminator (Critic) for 224x224 RGB images
+    Structure: 224x224 -> 112x112 -> 56x56 -> 28x28 -> 14x14 -> 7x7 -> 1
     Note: No BatchNorm, use LayerNorm instead for WGAN-GP
     """
     def __init__(self, ndf=64, nc=3, use_spectral_norm=False):
         super().__init__()
         
-        def conv_block(in_ch, out_ch, kernel=4, stride=2, padding=1, use_norm=True):
-            layers = []
-            conv = nn.Conv2d(in_ch, out_ch, kernel, stride, padding, bias=True)
-            if use_spectral_norm:
-                conv = nn.utils.spectral_norm(conv)
-            layers.append(conv)
-            if use_norm:
-                layers.append(nn.LayerNorm([out_ch, 0, 0]))  # Will be fixed
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
-            return layers
-        
         # 手動で各層を構築（LayerNormのサイズを正しく指定するため）
-        self.conv1 = nn.Conv2d(nc, ndf, 4, 2, 1, bias=True)  # 96 -> 48
+        self.conv1 = nn.Conv2d(nc, ndf, 4, 2, 1, bias=True)  # 224 -> 112
         self.act1 = nn.LeakyReLU(0.2, inplace=True)
         
-        self.conv2 = nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=True)  # 48 -> 24
-        self.ln2 = nn.LayerNorm([ndf * 2, 24, 24])
+        self.conv2 = nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=True)  # 112 -> 56
+        self.ln2 = nn.LayerNorm([ndf * 2, 56, 56])
         self.act2 = nn.LeakyReLU(0.2, inplace=True)
         
-        self.conv3 = nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=True)  # 24 -> 12
-        self.ln3 = nn.LayerNorm([ndf * 4, 12, 12])
+        self.conv3 = nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=True)  # 56 -> 28
+        self.ln3 = nn.LayerNorm([ndf * 4, 28, 28])
         self.act3 = nn.LeakyReLU(0.2, inplace=True)
         
-        self.conv4 = nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=True)  # 12 -> 6
-        self.ln4 = nn.LayerNorm([ndf * 8, 6, 6])
+        self.conv4 = nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=True)  # 28 -> 14
+        self.ln4 = nn.LayerNorm([ndf * 8, 14, 14])
         self.act4 = nn.LeakyReLU(0.2, inplace=True)
         
-        self.conv5 = nn.Conv2d(ndf * 8, 1, 6, 1, 0, bias=True)  # 6 -> 1
+        self.conv5 = nn.Conv2d(ndf * 8, ndf * 8, 4, 2, 1, bias=True)  # 14 -> 7
+        self.ln5 = nn.LayerNorm([ndf * 8, 7, 7])
+        self.act5 = nn.LeakyReLU(0.2, inplace=True)
+        
+        self.conv6 = nn.Conv2d(ndf * 8, 1, 7, 1, 0, bias=True)  # 7 -> 1
         
         if use_spectral_norm:
             self.conv1 = nn.utils.spectral_norm(self.conv1)
@@ -174,6 +178,7 @@ class Discriminator(nn.Module):
             self.conv3 = nn.utils.spectral_norm(self.conv3)
             self.conv4 = nn.utils.spectral_norm(self.conv4)
             self.conv5 = nn.utils.spectral_norm(self.conv5)
+            self.conv6 = nn.utils.spectral_norm(self.conv6)
         
         self.apply(weights_init)
     
@@ -182,7 +187,8 @@ class Discriminator(nn.Module):
         x = self.act2(self.ln2(self.conv2(x)))
         x = self.act3(self.ln3(self.conv3(x)))
         x = self.act4(self.ln4(self.conv4(x)))
-        x = self.conv5(x)
+        x = self.act5(self.ln5(self.conv5(x)))
+        x = self.conv6(x)
         return x.view(-1)
 
 
