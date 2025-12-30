@@ -396,40 +396,101 @@ def compute_r1_penalty(D, real_samples):
 
 # ========== Exponential Moving Average ==========
 class EMA:
-    """Exponential Moving Average for model parameters"""
+    """
+    Exponential Moving Average for model parameters
+    
+    重要: BatchNormのrunning_mean/running_varも保存することで、
+    eval()モードでの推論が正しく動作するようになります。
+    """
     def __init__(self, model, decay=0.999):
         self.model = model
         self.decay = decay
         self.shadow = {}
         self.backup = {}
+        self.bn_backup = {}
         
-        # Initialize shadow parameters
+        # Initialize shadow parameters (学習可能パラメータ)
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()
+        
+        # BatchNormのrunning統計も保存
+        self.bn_shadow = {}
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                self.bn_shadow[name + '.running_mean'] = module.running_mean.clone()
+                self.bn_shadow[name + '.running_var'] = module.running_var.clone()
+                self.bn_shadow[name + '.num_batches_tracked'] = module.num_batches_tracked.clone()
     
     def update(self):
+        # 学習可能パラメータのEMA更新
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.shadow[name] = self.decay * self.shadow[name] + (1 - self.decay) * param.data
+        
+        # BatchNormのrunning統計もEMA更新
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                key_mean = name + '.running_mean'
+                key_var = name + '.running_var'
+                key_num = name + '.num_batches_tracked'
+                self.bn_shadow[key_mean] = self.decay * self.bn_shadow[key_mean] + (1 - self.decay) * module.running_mean
+                self.bn_shadow[key_var] = self.decay * self.bn_shadow[key_var] + (1 - self.decay) * module.running_var
+                self.bn_shadow[key_num] = module.num_batches_tracked.clone()
     
     def apply_shadow(self):
+        # 学習可能パラメータを一時保存してEMAに置換
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.backup[name] = param.data.clone()
                 param.data = self.shadow[name]
+        
+        # BatchNormのrunning統計も置換
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                key_mean = name + '.running_mean'
+                key_var = name + '.running_var'
+                key_num = name + '.num_batches_tracked'
+                self.bn_backup[key_mean] = module.running_mean.clone()
+                self.bn_backup[key_var] = module.running_var.clone()
+                self.bn_backup[key_num] = module.num_batches_tracked.clone()
+                module.running_mean.copy_(self.bn_shadow[key_mean])
+                module.running_var.copy_(self.bn_shadow[key_var])
+                module.num_batches_tracked.copy_(self.bn_shadow[key_num])
     
     def restore(self):
+        # 学習可能パラメータを復元
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 param.data = self.backup[name]
         self.backup = {}
+        
+        # BatchNormのrunning統計も復元
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                key_mean = name + '.running_mean'
+                key_var = name + '.running_var'
+                key_num = name + '.num_batches_tracked'
+                module.running_mean.copy_(self.bn_backup[key_mean])
+                module.running_var.copy_(self.bn_backup[key_var])
+                module.num_batches_tracked.copy_(self.bn_backup[key_num])
+        self.bn_backup = {}
     
     def state_dict(self):
-        return self.shadow.copy()
+        # 学習可能パラメータとBN統計を両方保存
+        state = self.shadow.copy()
+        state.update(self.bn_shadow)
+        return state
     
     def load_state_dict(self, state_dict):
-        self.shadow = state_dict.copy()
+        # 学習可能パラメータとBN統計を分離して読み込み
+        self.shadow = {}
+        self.bn_shadow = {}
+        for key, value in state_dict.items():
+            if 'running_mean' in key or 'running_var' in key or 'num_batches_tracked' in key:
+                self.bn_shadow[key] = value
+            else:
+                self.shadow[key] = value
 
 
 # ========== Hinge Loss ==========
