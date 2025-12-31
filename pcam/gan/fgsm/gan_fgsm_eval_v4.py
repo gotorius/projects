@@ -62,7 +62,7 @@ def parse_args():
     parser.add_argument('--output_dir', type=str,
                         default='/mnt/data1/gotou/projects/pcam/gan/fgsm/results_v4')
     
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--latent_dim', type=int, default=512,
