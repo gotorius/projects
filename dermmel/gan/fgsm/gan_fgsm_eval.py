@@ -56,7 +56,7 @@ def parse_args():
                         default='/mnt/data1/gotou/projects/dermmel/ddpm/correct_samples_balanced_500.pt',
                         help='Path to cached correct samples')
     parser.add_argument('--gan_ckpt', type=str,
-                        default='/mnt/data1/gotou/projects/dermmel/gan/checkpoints/final_model.pth',
+                        default='/mnt/data1/gotou/projects/dermmel/gan/checkpoints/20260102_195110/final_model.pth',
                         help='GAN checkpoint path')
     parser.add_argument('--clf_ckpt', type=str,
                         default='/mnt/data1/gotou/projects/dermmel/resnet/resnet50_best.pth',
@@ -66,7 +66,7 @@ def parse_args():
                         help='Output directory')
     
     # 実行設定
-    parser.add_argument('--batch_size', type=int, default=16,
+    parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size for evaluation')
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU ID')

@@ -61,7 +61,7 @@ def get_args():
                         default='/mnt/data1/gotou/projects/dermmel/gan/checkpoints',
                         help='モデル保存先')
     parser.add_argument('--image_size', type=int, default=224, help='画像サイズ (224固定)')
-    parser.add_argument('--batch_size', type=int, default=16, help='バッチサイズ')
+    parser.add_argument('--batch_size', type=int, default=8, help='バッチサイズ')
     parser.add_argument('--epochs', type=int, default=200, help='エポック数')
     parser.add_argument('--lr_g', type=float, default=1e-4, help='Generatorの学習率')
     parser.add_argument('--lr_d', type=float, default=4e-4, help='Discriminatorの学習率 (TTUR: D > G)')
