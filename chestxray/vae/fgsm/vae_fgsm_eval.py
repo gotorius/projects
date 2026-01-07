@@ -51,8 +51,8 @@ def parse_args():
     # VAE設定
     parser.add_argument('--latent_dim', type=int, default=256,
                         help='Latent dimension')
-    parser.add_argument('--base_ch', type=int, default=64,
-                        help='Base channels')
+    parser.add_argument('--base_ch', type=int, default=48,
+                        help='Base channels (v3: 48, default for v3)')
     
     # 実行設定
     parser.add_argument('--batch_size', type=int, default=32,
@@ -65,7 +65,7 @@ def parse_args():
                         default='/mnt/data1/gotou/projects/chestxray/correct_samples_500.pt',
                         help='Path to cached samples')
     parser.add_argument('--vae_ckpt', type=str,
-                        default='/mnt/data1/gotou/projects/chestxray/vae/checkpoints/best_model.pth',
+                        default='/mnt/data1/gotou/projects/chestxray/vae/checkpoints_v3/20260105_175040/best_model.pth',
                         help='VAE checkpoint path')
     parser.add_argument('--clf_ckpt', type=str,
                         default='/mnt/data1/gotou/projects/chestxray/resnet/resnet50_best.pth',
@@ -89,8 +89,63 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-# ========== Residual Block ==========
+# ========== Residual Block (v3アーキテクチャ用) ==========
+class ResBlockEncoder(nn.Module):
+    """Residual Block for Encoder"""
+    def __init__(self, in_ch, out_ch, downsample=True):
+        super().__init__()
+        self.downsample = downsample
+        
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, 1, 1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1)
+        self.bn1 = nn.BatchNorm2d(in_ch)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+    
+    def forward(self, x):
+        h = F.leaky_relu(self.bn1(x), 0.2)
+        h = self.conv1(h)
+        h = F.leaky_relu(self.bn2(h), 0.2)
+        h = self.conv2(h)
+        
+        x = self.skip(x)
+        
+        if self.downsample:
+            h = F.avg_pool2d(h, 2)
+            x = F.avg_pool2d(x, 2)
+        
+        return h + x
+
+
+class ResBlockDecoder(nn.Module):
+    """Residual Block for Decoder"""
+    def __init__(self, in_ch, out_ch, upsample=True):
+        super().__init__()
+        self.upsample = upsample
+        
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, 1, 1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1)
+        self.bn1 = nn.BatchNorm2d(in_ch)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+    
+    def forward(self, x):
+        h = F.relu(self.bn1(x))
+        if self.upsample:
+            h = F.interpolate(h, scale_factor=2, mode='bilinear', align_corners=False)
+        h = self.conv1(h)
+        h = F.relu(self.bn2(h))
+        h = self.conv2(h)
+        
+        if self.upsample:
+            x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = self.skip(x)
+        
+        return h + x
+
+
 class ResidualBlock(nn.Module):
+    """Backward compatibility"""
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
@@ -106,89 +161,76 @@ class ResidualBlock(nn.Module):
         return self.act(h + self.skip(x))
 
 
-# ========== Encoder ==========
+# ========== Encoder (v3アーキテクチャ) ==========
 class Encoder(nn.Module):
-    def __init__(self, img_channels=1, base_ch=64, latent_dim=256):
+    """Memory-efficient Encoder: 224 -> 7 -> latent"""
+    def __init__(self, img_channels=1, base_ch=48, latent_dim=256):
         super().__init__()
         
-        self.encoder = nn.Sequential(
-            nn.Conv2d(img_channels, base_ch, 4, 2, 1),
-            nn.BatchNorm2d(base_ch),
-            nn.LeakyReLU(0.2),
-            ResidualBlock(base_ch, base_ch),
-            
-            nn.Conv2d(base_ch, base_ch * 2, 4, 2, 1),
-            nn.BatchNorm2d(base_ch * 2),
-            nn.LeakyReLU(0.2),
-            ResidualBlock(base_ch * 2, base_ch * 2),
-            
-            nn.Conv2d(base_ch * 2, base_ch * 4, 4, 2, 1),
-            nn.BatchNorm2d(base_ch * 4),
-            nn.LeakyReLU(0.2),
-            ResidualBlock(base_ch * 4, base_ch * 4),
-            
-            nn.Conv2d(base_ch * 4, base_ch * 8, 4, 2, 1),
-            nn.BatchNorm2d(base_ch * 8),
-            nn.LeakyReLU(0.2),
-            ResidualBlock(base_ch * 8, base_ch * 8),
-            
-            nn.Conv2d(base_ch * 8, base_ch * 8, 4, 2, 1),
-            nn.BatchNorm2d(base_ch * 8),
-            nn.LeakyReLU(0.2),
-        )
+        self.conv_in = nn.Conv2d(img_channels, base_ch, 3, 1, 1)
         
+        # 224 -> 112 -> 56 -> 28 -> 14 -> 7
+        self.block1 = ResBlockEncoder(base_ch, base_ch, downsample=True)
+        self.block2 = ResBlockEncoder(base_ch, base_ch * 2, downsample=True)
+        self.block3 = ResBlockEncoder(base_ch * 2, base_ch * 4, downsample=True)
+        self.block4 = ResBlockEncoder(base_ch * 4, base_ch * 8, downsample=True)
+        self.block5 = ResBlockEncoder(base_ch * 8, base_ch * 8, downsample=True)
+        
+        self.bn_out = nn.BatchNorm2d(base_ch * 8)
+        
+        # Latent projections
         self.fc_mu = nn.Linear(base_ch * 8 * 7 * 7, latent_dim)
         self.fc_logvar = nn.Linear(base_ch * 8 * 7 * 7, latent_dim)
     
     def forward(self, x):
-        h = self.encoder(x)
+        h = self.conv_in(x)
+        h = self.block1(h)
+        h = self.block2(h)
+        h = self.block3(h)
+        h = self.block4(h)
+        h = self.block5(h)
+        h = F.leaky_relu(self.bn_out(h), 0.2)
+        
         h = h.view(h.size(0), -1)
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
+        
         return mu, logvar
 
 
-# ========== Decoder ==========
+# ========== Decoder (v3アーキテクチャ) ==========
 class Decoder(nn.Module):
-    def __init__(self, img_channels=1, base_ch=64, latent_dim=256):
+    """Memory-efficient Decoder: latent -> 7 -> 224"""
+    def __init__(self, img_channels=1, base_ch=48, latent_dim=256):
         super().__init__()
-        
-        self.fc = nn.Sequential(
-            nn.Linear(latent_dim, base_ch * 8 * 7 * 7),
-            nn.ReLU()
-        )
-        
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(base_ch * 8, base_ch * 8, 4, 2, 1),
-            nn.BatchNorm2d(base_ch * 8),
-            nn.ReLU(),
-            ResidualBlock(base_ch * 8, base_ch * 8),
-            
-            nn.ConvTranspose2d(base_ch * 8, base_ch * 4, 4, 2, 1),
-            nn.BatchNorm2d(base_ch * 4),
-            nn.ReLU(),
-            ResidualBlock(base_ch * 4, base_ch * 4),
-            
-            nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 4, 2, 1),
-            nn.BatchNorm2d(base_ch * 2),
-            nn.ReLU(),
-            ResidualBlock(base_ch * 2, base_ch * 2),
-            
-            nn.ConvTranspose2d(base_ch * 2, base_ch, 4, 2, 1),
-            nn.BatchNorm2d(base_ch),
-            nn.ReLU(),
-            ResidualBlock(base_ch, base_ch),
-            
-            nn.ConvTranspose2d(base_ch, img_channels, 4, 2, 1),
-            nn.Sigmoid()
-        )
-        
         self.base_ch = base_ch
+        
+        self.fc = nn.Linear(latent_dim, base_ch * 8 * 7 * 7)
+        
+        # 7 -> 14 -> 28 -> 56 -> 112 -> 224
+        self.block1 = ResBlockDecoder(base_ch * 8, base_ch * 8, upsample=True)
+        self.block2 = ResBlockDecoder(base_ch * 8, base_ch * 4, upsample=True)
+        self.block3 = ResBlockDecoder(base_ch * 4, base_ch * 2, upsample=True)
+        self.block4 = ResBlockDecoder(base_ch * 2, base_ch, upsample=True)
+        self.block5 = ResBlockDecoder(base_ch, base_ch, upsample=True)
+        
+        self.bn_out = nn.BatchNorm2d(base_ch)
+        self.conv_out = nn.Conv2d(base_ch, img_channels, 3, 1, 1)
     
     def forward(self, z):
         h = self.fc(z)
         h = h.view(-1, self.base_ch * 8, 7, 7)
-        return self.decoder(h)
+        
+        h = self.block1(h)
+        h = self.block2(h)
+        h = self.block3(h)
+        h = self.block4(h)
+        h = self.block5(h)
+        
+        h = F.relu(self.bn_out(h))
+        h = self.conv_out(h)
+        
+        return torch.sigmoid(h)
 
 
 # ========== VAE ==========
@@ -310,7 +352,17 @@ def load_models(args, device):
         base_ch = args.base_ch
     
     vae = VAE(img_channels=1, base_ch=base_ch, latent_dim=latent_dim).to(device)
-    vae.load_state_dict(vae_ckpt['model_state_dict'])
+    
+    # キー名の互換性対応
+    if 'vae_state_dict' in vae_ckpt:
+        vae.load_state_dict(vae_ckpt['vae_state_dict'])
+    elif 'model_state_dict' in vae_ckpt:
+        vae.load_state_dict(vae_ckpt['model_state_dict'])
+    elif 'ema_state_dict' in vae_ckpt:
+        vae.load_state_dict(vae_ckpt['ema_state_dict'])
+    else:
+        vae.load_state_dict(vae_ckpt)
+    
     vae.eval()
     print(f"Loaded VAE from {args.vae_ckpt}")
     
@@ -320,10 +372,30 @@ def load_models(args, device):
 # ========== データ読み込み ==========
 def load_cached_samples(path, device):
     data = torch.load(path, map_location='cpu')
-    x_test = data['images']
-    y_test = data['labels']
+    
+    # キー名の互換性対応
+    if 'images' in data:
+        x_test = data['images']
+    elif 'x_test' in data:
+        x_test = data['x_test']
+    elif 'x' in data:
+        x_test = data['x']
+    else:
+        raise KeyError(f"Cannot find image data. Available keys: {data.keys()}")
+    
+    if 'labels' in data:
+        y_test = data['labels']
+    elif 'y_test' in data:
+        y_test = data['y_test']
+    elif 'y' in data:
+        y_test = data['y']
+    else:
+        raise KeyError(f"Cannot find label data. Available keys: {data.keys()}")
+    
     print(f"Loaded {len(x_test)} cached samples from {path}")
-    return x_test, y_test
+    print(f"Data shape: {x_test.shape}, Label shape: {y_test.shape}")
+    
+    return x_test.to(device), y_test.to(device)
 
 
 # ========== FGSM攻撃 ==========
@@ -560,18 +632,65 @@ def main():
         os.path.join(log_dir, 'samples')
     )
     
-    # 結果保存
-    with open(os.path.join(log_dir, 'results.json'), 'w') as f:
-        results_save = {k: v for k, v in results.items() if k != 'confusion_matrices'}
-        results_save['confusion_matrices'] = {
-            k: {kk: int(vv) if isinstance(vv, (int, np.integer)) else float(vv)
-                for kk, vv in v.items()}
-            for k, v in results['confusion_matrices'].items()
-        }
-        json.dump(results_save, f, indent=2)
+    # 結果保存（テキスト形式）
+    with open(os.path.join(log_dir, 'results.txt'), 'w') as f:
+        f.write("="*70 + "\n")
+        f.write("FGSM Attack + VAE (MagNet) Defense Evaluation Results\n")
+        f.write("="*70 + "\n\n")
+        
+        f.write(f"Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)\n")
+        f.write(f"Defense: VAE (MagNet-style)\n")
+        f.write(f"VAE: latent_dim={args.latent_dim}, base_ch={args.base_ch}\n")
+        f.write(f"Samples: {len(x_test)}\n")
+        f.write(f"Batch size: {args.batch_size}\n\n")
+        
+        f.write("-"*70 + "\n")
+        f.write("Clean Accuracy:\n")
+        f.write("-"*70 + "\n")
+        f.write(f"  Classifier only:             {results['clean_acc_classifier']:.4f}\n")
+        f.write(f"  With VAE purification:       {results['clean_acc_with_vae']:.4f}\n\n")
+        
+        f.write("-"*70 + "\n")
+        f.write("Adversarial Accuracy (FGSM):\n")
+        f.write("-"*70 + "\n")
+        f.write(f"  Without defense:             {results['adv_acc_no_defense']:.4f}\n")
+        f.write(f"  With VAE purification:       {results['adv_acc_with_vae']:.4f}\n")
+        f.write(f"  Defense improvement:         {results['defense_improvement']:+.4f}\n\n")
+        
+        f.write(f"Attack time: {results['attack_time']:.2f}s\n\n")
+        
+        f.write("="*70 + "\n")
+        f.write("Confusion Matrices\n")
+        f.write("="*70 + "\n\n")
+        
+        cm_names = [
+            "1. Clean Images (Classifier only)",
+            "2. Clean Images (with VAE)",
+            "3. Adversarial Images (No Defense)",
+            "4. Adversarial Images (with VAE)"
+        ]
+        cm_keys = ['clean', 'clean_purified', 'adv_no_defense', 'adv_defended']
+        
+        for name, key in zip(cm_names, cm_keys):
+            cm = results['confusion_matrices'][key]
+            f.write(f"{name}\n")
+            f.write("-"*50 + "\n")
+            f.write(f"{'':>15} {'Pred NORMAL':>15} {'Pred PNEUMONIA':>15}\n")
+            f.write(f"{'True NORMAL':>15} {cm['tn']:>15} {cm['fp']:>15}\n")
+            f.write(f"{'True PNEUMONIA':>15} {cm['fn']:>15} {cm['tp']:>15}\n\n")
+            
+            f.write(f"  Accuracy:  {cm['accuracy']:.4f}\n")
+            f.write(f"  Precision: {cm['precision']:.4f}\n")
+            f.write(f"  Recall:    {cm['recall']:.4f}\n")
+            f.write(f"  F1-score:  {cm['f1']:.4f}\n\n")
     
-    with open(os.path.join(log_dir, 'config.json'), 'w') as f:
-        json.dump(vars(args), f, indent=2)
+    # 設定保存（テキスト形式）
+    with open(os.path.join(log_dir, 'config.txt'), 'w') as f:
+        f.write("="*70 + "\n")
+        f.write("Configuration\n")
+        f.write("="*70 + "\n\n")
+        for key, value in vars(args).items():
+            f.write(f"{key}: {value}\n")
     
     print(f"\nResults saved to {log_dir}")
 
