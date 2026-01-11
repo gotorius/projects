@@ -1,18 +1,21 @@
 """
-VAE (MagNet-style) AutoAttack Evaluation Script for PCam (PatchCamelyon) Dataset
+VAE (MagNet-style) FGSM Evaluation Script for DermMel Dataset
 
 Reference:
 "MagNet: a Two-Pronged Defense against Adversarial Examples"
 Meng & Chen, ACM CCS 2017
 
+MagNetの防御:
+VAEで画像を再構成することで敵対的摂動を除去
+
 評価内容:
 1. クリーン画像の分類精度
 2. クリーン画像を浄化した後の分類精度
-3. AutoAttack敵対的画像の分類精度（防御なし）
-4. AutoAttack敵対的画像を浄化した後の分類精度（防御あり）
+3. FGSM敵対的画像の分類精度（防御なし）
+4. FGSM敵対的画像を浄化した後の分類精度（防御あり）
 
 実行例:
-python vae_autoattack_eval.py --vae_ckpt ../checkpoints_v2/20260108_165711/best_model.pth --gpu 0
+python vae_fgsm_eval.py --vae_ckpt ../checkpoints/20260110_211546/best_model.pth --gpu 0
 """
 
 import os
@@ -26,58 +29,48 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import torchvision.models as models
-from torchvision import transforms
 from torchvision.utils import save_image, make_grid
 from sklearn.metrics import confusion_matrix
 import numpy as np
-from PIL import Image
 from pathlib import Path
 from tqdm.auto import tqdm
-
-from autoattack import AutoAttack
 
 
 # ========== 引数パーサー ==========
 def parse_args():
-    parser = argparse.ArgumentParser(description='VAE (MagNet) AutoAttack Evaluation for PCam')
+    parser = argparse.ArgumentParser(description='VAE (MagNet) FGSM Evaluation for DermMel')
     
     # 攻撃設定
     parser.add_argument('--epsilon', type=float, default=8/255,
-                        help='AutoAttack perturbation epsilon')
-    parser.add_argument('--attack_version', type=str, default='standard',
-                        choices=['standard', 'plus', 'rand'],
-                        help='AutoAttack version')
+                        help='FGSM perturbation epsilon')
     
     # VAE設定
     parser.add_argument('--latent_dim', type=int, default=512,
-                        help='Latent dimension (v2: 512)')
+                        help='Latent dimension')
     parser.add_argument('--base_ch', type=int, default=64,
-                        help='Base channels (v2: 64)')
+                        help='Base channels')
     
     # 実行設定
-    parser.add_argument('--batch_size', type=int, default=16,
+    parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size for evaluation')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     
     # パス設定
     parser.add_argument('--cached_samples', type=str,
-                        default='/mnt/data1/gotou/projects/pcam/ddpm/correct_samples_balanced_500.pt',
+                        default='/mnt/data1/gotou/projects/dermmel/ddpm/correct_samples_balanced_500.pt',
                         help='Path to cached samples')
     parser.add_argument('--vae_ckpt', type=str,
-                        default='/mnt/data1/gotou/projects/pcam/vae/checkpoints_v2/20260108_165711/best_model.pth',
+                        default='/mnt/data1/gotou/projects/dermmel/vae/checkpoints/20260110_211546/best_model.pth',
                         help='VAE checkpoint path')
     parser.add_argument('--clf_ckpt', type=str,
-                        default='/mnt/data1/gotou/projects/pcam/resnet/checkpoints/best_resnet50_pcam.pth',
+                        default='/mnt/data1/gotou/projects/dermmel/resnet/resnet50_best.pth',
                         help='Classifier checkpoint path')
     parser.add_argument('--output_dir', type=str,
-                        default='/mnt/data1/gotou/projects/pcam/vae/autoattack/results',
+                        default='/mnt/data1/gotou/projects/dermmel/vae/fgsm/results',
                         help='Output directory')
-    parser.add_argument('--data_dir', type=str,
-                        default='/mnt/data1/Public/MedImages/PCam_ImageFolder',
-                        help='Data directory')
     
     # GPU設定
     parser.add_argument('--gpu', type=int, default=2,
@@ -91,7 +84,7 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-# ========== Residual Block (v2アーキテクチャ用) ==========
+# ========== Residual Block ==========
 class ResBlockEncoder(nn.Module):
     """Residual Block for Encoder"""
     def __init__(self, in_ch, out_ch, downsample=True):
@@ -146,7 +139,7 @@ class ResBlockDecoder(nn.Module):
         return h + x
 
 
-# ========== Encoder (RGB入力) ==========
+# ========== Encoder ==========
 class Encoder(nn.Module):
     """Encoder for RGB images: 224 -> 7 -> latent"""
     def __init__(self, img_channels=3, base_ch=64, latent_dim=512):
@@ -183,7 +176,7 @@ class Encoder(nn.Module):
         return mu, logvar
 
 
-# ========== Decoder (RGB出力) ==========
+# ========== Decoder ==========
 class Decoder(nn.Module):
     """Decoder for RGB images: latent -> 7 -> 224"""
     def __init__(self, img_channels=3, base_ch=64, latent_dim=512):
@@ -246,7 +239,7 @@ class VAE(nn.Module):
 
 # ========== VAE Purifier (MagNet-style) ==========
 class VAEPurifier(nn.Module):
-    """VAEで画像を再構成して敵対的摂動を除去（RGB直接処理）"""
+    """VAEで画像を再構成して敵対的摂動を除去"""
     def __init__(self, vae, device):
         super().__init__()
         self.vae = vae
@@ -255,8 +248,6 @@ class VAEPurifier(nn.Module):
     def forward(self, x_rgb):
         """
         RGB画像 [0,1] を浄化
-        x_rgb: (B, 3, H, W), [0, 1]
-        return: 浄化されたRGB画像 (B, 3, H, W), [0, 1]
         """
         self.vae.eval()
         with torch.no_grad():
@@ -301,11 +292,8 @@ class VAEDefenseWrapper(nn.Module):
 def load_models(args, device):
     # 分類器
     classifier = models.resnet50(weights=None)
-    # チェックポイントがnn.Sequential形式（fc.1.weight）で保存されている場合に対応
-    classifier.fc = nn.Sequential(
-        nn.Dropout(0.5),
-        nn.Linear(classifier.fc.in_features, 2)
-    )
+    classifier.fc = nn.Linear(classifier.fc.in_features, 2)
+    
     checkpoint = torch.load(args.clf_ckpt, map_location=device, weights_only=False)
     if 'model_state_dict' in checkpoint:
         classifier.load_state_dict(checkpoint['model_state_dict'])
@@ -325,10 +313,8 @@ def load_models(args, device):
     
     print(f"VAE config: latent_dim={latent_dim}, base_ch={base_ch}")
     
-    # PCam用VAEはRGB (img_channels=3)
     vae = VAE(img_channels=3, base_ch=base_ch, latent_dim=latent_dim).to(device)
     
-    # キー名の互換性対応
     if 'vae_state_dict' in vae_ckpt:
         vae.load_state_dict(vae_ckpt['vae_state_dict'])
     elif 'ema_state_dict' in vae_ckpt and vae_ckpt['ema_state_dict'] is not None:
@@ -347,6 +333,7 @@ def load_models(args, device):
 
 # ========== データ読み込み ==========
 def load_cached_samples(path, device):
+    """キャッシュされたサンプルを読み込む"""
     data = torch.load(path, map_location='cpu', weights_only=False)
     
     # キー名の互換性対応
@@ -372,6 +359,22 @@ def load_cached_samples(path, device):
     print(f"Data shape: {x_test.shape}, Label shape: {y_test.shape}")
     
     return x_test.to(device), y_test.to(device)
+
+
+# ========== FGSM攻撃 ==========
+def fgsm_attack(model, x, y, epsilon, device):
+    """FGSM攻撃"""
+    x = x.clone().to(device)
+    x.requires_grad = True
+    
+    outputs = model(x)
+    loss = F.cross_entropy(outputs, y.to(device))
+    loss.backward()
+    
+    x_adv = x + epsilon * x.grad.sign()
+    x_adv = torch.clamp(x_adv, 0, 1)
+    
+    return x_adv.detach()
 
 
 # ========== 評価関数 ==========
@@ -458,7 +461,7 @@ def main():
     print(f"Using device: {device}")
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join(args.output_dir, f"autoattack_eps{args.epsilon:.4f}_{args.attack_version}_{timestamp}")
+    log_dir = os.path.join(args.output_dir, f"fgsm_eps{args.epsilon:.4f}_{timestamp}")
     os.makedirs(log_dir, exist_ok=True)
     print(f"Output directory: {log_dir}")
     
@@ -469,17 +472,16 @@ def main():
     classifier_model = ClassifierWrapper(classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
     defense_model = VAEDefenseWrapper(purifier, classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
     
-    # PCamのクラス名
-    classes = ['0', '1']  # 0: 転移なし, 1: 転移あり
+    # DermMelのクラス名
+    classes = ['Melanoma', 'NotMelanoma']
     print(f"Classes: {classes}")
     
     x_test, y_test = load_cached_samples(args.cached_samples, device)
     
     print(f"\n{'='*70}")
-    print("AutoAttack + VAE (MagNet) Defense Evaluation for PCam")
+    print("FGSM Attack + VAE (MagNet) Defense Evaluation for DermMel")
     print(f"{'='*70}")
     print(f"Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
-    print(f"Attack version: {args.attack_version}")
     print(f"VAE: latent_dim={args.latent_dim}, base_ch={args.base_ch}")
     print(f"Samples: {len(x_test)}")
     print(f"{'='*70}")
@@ -498,16 +500,17 @@ def main():
     print(f"Clean accuracy (with VAE): {clean_purified_acc:.4f}")
     results['clean_acc_with_vae'] = clean_purified_acc
     
-    # 3. AutoAttack & 敵対的画像の精度（防御なし）
-    print("\n[3/4] Running AutoAttack and evaluating adversarial images...")
+    # 3. FGSM攻撃 & 敵対的画像の精度（防御なし）
+    print("\n[3/4] Running FGSM attack and evaluating adversarial images...")
     start_time = time.time()
     
-    # AutoAttackの設定
-    adversary = AutoAttack(classifier_model, norm='Linf', eps=args.epsilon, 
-                           version=args.attack_version, verbose=True)
-    
-    # 攻撃実行
-    x_adv = adversary.run_standard_evaluation(x_test, y_test, bs=args.batch_size)
+    x_adv_list = []
+    for i in tqdm(range(0, len(x_test), args.batch_size), desc="FGSM Attack"):
+        x_batch = x_test[i:i+args.batch_size].to(device)
+        y_batch = y_test[i:i+args.batch_size].to(device)
+        x_adv_batch = fgsm_attack(classifier_model, x_batch, y_batch, args.epsilon, device)
+        x_adv_list.append(x_adv_batch.cpu())
+    x_adv = torch.cat(x_adv_list, dim=0)
     
     attack_time = time.time() - start_time
     
@@ -529,14 +532,14 @@ def main():
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
-    print(f"Attack: AutoAttack ({args.attack_version}), Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
+    print(f"Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
     print(f"Defense: VAE (MagNet-style)")
     print(f"-"*70)
     print(f"Clean Accuracy:")
     print(f"  Classifier only:             {results['clean_acc_classifier']:.4f}")
     print(f"  With VAE purification:       {results['clean_acc_with_vae']:.4f}")
     print(f"-"*70)
-    print(f"Adversarial Accuracy (AutoAttack):")
+    print(f"Adversarial Accuracy (FGSM):")
     print(f"  Without defense:             {results['adv_acc_no_defense']:.4f}")
     print(f"  With VAE purification:       {results['adv_acc_with_vae']:.4f}")
     print(f"  Defense improvement:         {results['defense_improvement']:+.4f}")
@@ -595,10 +598,10 @@ def main():
     # 結果保存（テキスト形式）
     with open(os.path.join(log_dir, 'results.txt'), 'w') as f:
         f.write("="*70 + "\n")
-        f.write("AutoAttack + VAE (MagNet) Defense Evaluation Results for PCam\n")
+        f.write("FGSM Attack + VAE (MagNet) Defense Evaluation Results for DermMel\n")
         f.write("="*70 + "\n\n")
         
-        f.write(f"Attack: AutoAttack ({args.attack_version}), Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)\n")
+        f.write(f"Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)\n")
         f.write(f"Defense: VAE (MagNet-style)\n")
         f.write(f"VAE: latent_dim={args.latent_dim}, base_ch={args.base_ch}\n")
         f.write(f"Samples: {len(x_test)}\n")
@@ -611,7 +614,7 @@ def main():
         f.write(f"  With VAE purification:       {results['clean_acc_with_vae']:.4f}\n\n")
         
         f.write("-"*70 + "\n")
-        f.write("Adversarial Accuracy (AutoAttack):\n")
+        f.write("Adversarial Accuracy (FGSM):\n")
         f.write("-"*70 + "\n")
         f.write(f"  Without defense:             {results['adv_acc_no_defense']:.4f}\n")
         f.write(f"  With VAE purification:       {results['adv_acc_with_vae']:.4f}\n")
@@ -635,16 +638,16 @@ def main():
             cm = results['confusion_matrices'][key]
             f.write(f"{name}\n")
             f.write("-"*50 + "\n")
-            f.write(f"{'':>15} {'Pred 0':>15} {'Pred 1':>15}\n")
-            f.write(f"{'True 0':>15} {cm['tn']:>15} {cm['fp']:>15}\n")
-            f.write(f"{'True 1':>15} {cm['fn']:>15} {cm['tp']:>15}\n\n")
+            f.write(f"{'':>15} {'Pred Mel':>15} {'Pred NotMel':>15}\n")
+            f.write(f"{'True Mel':>15} {cm['tn']:>15} {cm['fp']:>15}\n")
+            f.write(f"{'True NotMel':>15} {cm['fn']:>15} {cm['tp']:>15}\n\n")
             
             f.write(f"  Accuracy:  {cm['accuracy']:.4f}\n")
             f.write(f"  Precision: {cm['precision']:.4f}\n")
             f.write(f"  Recall:    {cm['recall']:.4f}\n")
             f.write(f"  F1-score:  {cm['f1']:.4f}\n\n")
     
-    # 設定保存（テキスト形式）
+    # 設定保存
     with open(os.path.join(log_dir, 'config.txt'), 'w') as f:
         f.write("="*70 + "\n")
         f.write("Configuration\n")

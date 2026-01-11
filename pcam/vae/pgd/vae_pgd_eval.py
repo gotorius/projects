@@ -79,7 +79,7 @@ def parse_args():
                         help='Data directory')
     
     # GPU設定
-    parser.add_argument('--gpu', type=int, default=2,
+    parser.add_argument('--gpu', type=int, default=1,
                         help='GPU ID')
     
     return parser.parse_args()
