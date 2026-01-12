@@ -69,7 +69,7 @@ def parse_args():
                         help='Base channels')
     
     # 実行設定
-    parser.add_argument('--batch_size', type=int, default=16,
+    parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size for evaluation')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
@@ -89,7 +89,7 @@ def parse_args():
                         help='Output directory')
     
     # GPU設定
-    parser.add_argument('--gpu', type=int, default=1,
+    parser.add_argument('--gpu', type=int, default=0,
                         help='GPU ID')
     
     return parser.parse_args()
@@ -271,11 +271,13 @@ class ClassifierWrapper(nn.Module):
     def __init__(self, classifier, mean, std):
         super().__init__()
         self.classifier = classifier
-        self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
-        self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
+        self.register_buffer('mean', torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1))
+        self.device_override = None
     
     def forward(self, x):
         # 入力は[0,1]、内部でImageNet正規化
+        # バッファーを入力と同じデバイスに移動
         mean = self.mean.to(x.device)
         std = self.std.to(x.device)
         x_norm = (x - mean) / std
@@ -289,14 +291,17 @@ class VAEDefenseWrapper(nn.Module):
         super().__init__()
         self.purifier = purifier
         self.classifier = classifier
-        self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
-        self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
+        self.register_buffer('mean', torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1))
     
     def forward(self, x):
         x_purified = self.purifier(x)
+        # バッファーを入力と同じデバイスに移動
         mean = self.mean.to(x.device)
         std = self.std.to(x.device)
         x_norm = (x_purified - mean) / std
+        # 分類器もデバイス確認（念のため）
+        self.classifier = self.classifier.to(x.device)
         return self.classifier(x_norm)
 
 
@@ -473,6 +478,9 @@ def main():
     classifier_model = ClassifierWrapper(classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
     defense_model = VAEDefenseWrapper(purifier, classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
     
+    # AutoAttackが使用するデバイスを明示的に設定
+    classifier_model.device = device
+    
     # DermMelのクラス名
     classes = ['Melanoma', 'NotMelanoma']
     print(f"Classes: {classes}")
@@ -508,12 +516,21 @@ def main():
     print(f"  This may take a while...")
     start_time = time.time()
     
+    # メモリを解放
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    
     # AutoAttackの設定
+    # 注：AutoAttackは入力のデバイスを使用するため、明示的にdeviceを指定する必要がある
     adversary = AutoAttack(classifier_model, norm=args.norm, eps=args.epsilon, 
-                           version=args.attack_version, verbose=True)
+                           version=args.attack_version, verbose=True, device=device)
     
     # 攻撃実行
     x_adv = adversary.run_standard_evaluation(x_test, y_test, bs=args.batch_size)
+    
+    # メモリを解放
+    torch.cuda.empty_cache()
     
     attack_time = time.time() - start_time
     
