@@ -41,8 +41,15 @@ import sys
 import argparse
 import time
 import json
+import ssl
+import urllib.request
 from datetime import datetime
 from pathlib import Path
+
+# SSL証明書検証エラーを回避するための設定
+# ネットワーク環境によってはSSLハンドシェイクが失敗することがあるため
+ssl._create_default_https_context = ssl._create_unverified_context
+os.environ['CURL_CA_BUNDLE'] = ''
 
 import torch
 import torch.nn as nn
