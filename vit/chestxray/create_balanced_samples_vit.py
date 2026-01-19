@@ -98,7 +98,7 @@ def main():
     std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
     
     correct_samples = {i: {'images': [], 'labels': []} for i in range(2)}
-    target_per_class = 250
+    total_target = 500  # 合計目標数
     
     print("\nCollecting correctly classified samples...")
     
@@ -112,33 +112,46 @@ def main():
             outputs = classifier(images_norm)
             _, predicted = outputs.max(1)
             
-            # 正しく分類された画像を収集
+            # 正しく分類された画像を全て収集
             correct_mask = (predicted == labels)
             
             for i in range(len(images)):
                 if correct_mask[i]:
                     label = labels[i].item()
-                    if len(correct_samples[label]['images']) < target_per_class:
-                        correct_samples[label]['images'].append(images[i].cpu())
-                        correct_samples[label]['labels'].append(label)
-            
-            # 両クラスとも目標数に達したら終了
-            if all(len(correct_samples[c]['images']) >= target_per_class 
-                   for c in range(2)):
-                break
+                    correct_samples[label]['images'].append(images[i].cpu())
+                    correct_samples[label]['labels'].append(label)
     
     # 結果を確認
-    print("\nCollected samples:")
+    print("\nCorrectly classified samples per class:")
     for i, class_name in enumerate(classes):
         print(f"  {class_name}: {len(correct_samples[i]['images'])} samples")
     
-    # 各クラスから250枚ずつ取得
+    # 動的に枚数を決定（ポジティブクラスを優先、不足分をネガティブから補充）
+    pneumonia_count = len(correct_samples[1]['images'])  # pneumoniaはクラス1
+    normal_count = total_target - pneumonia_count  # normal（クラス0）は残りで補充
+    
+    print(f"\nTarget distribution for 500 total samples:")
+    print(f"  PNEUMONIA (positive): {pneumonia_count} samples")
+    print(f"  NORMAL (negative): {normal_count} samples")
+    
+    # 十分なサンプルがあるか確認
+    if len(correct_samples[0]['images']) < normal_count:
+        normal_count = len(correct_samples[0]['images'])
+        actual_total = pneumonia_count + normal_count
+        print(f"\nWarning: Not enough NORMAL samples. Using {normal_count} NORMAL samples")
+        print(f"Actual total: {actual_total} samples")
+    
+    # 各クラスから必要な枚数を取得
     x_test = []
     y_test = []
     
-    for i in range(2):
-        x_test.extend(correct_samples[i]['images'][:target_per_class])
-        y_test.extend(correct_samples[i]['labels'][:target_per_class])
+    # ポジティブクラス（PNEUMONIA）を全て追加
+    x_test.extend(correct_samples[1]['images'][:pneumonia_count])
+    y_test.extend(correct_samples[1]['labels'][:pneumonia_count])
+    
+    # ネガティブクラス（NORMAL）から必要な分を追加
+    x_test.extend(correct_samples[0]['images'][:normal_count])
+    y_test.extend(correct_samples[0]['labels'][:normal_count])
     
     x_test = torch.stack(x_test)
     y_test = torch.tensor(y_test)
