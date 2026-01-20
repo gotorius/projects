@@ -65,7 +65,7 @@ def parse_args():
                         default='/mnt/data1/gotou/projects/vit/chestxray/correct_samples_balanced_500_vit.pt',
                         help='Path to cached samples (.pt file)')
     parser.add_argument('--vae_ckpt', type=str,
-                        default='/mnt/data1/gotou/projects/chestxray/vae/checkpoints_v3/20260105_175040/best_model.pth',
+                        default='/mnt/data1/gotou/projects/resnet/chestxray/vae/checkpoints_v3/20260105_175040/best_model.pth',
                         help='VAE checkpoint path')
     parser.add_argument('--clf_ckpt', type=str,
                         default='/mnt/data1/gotou/projects/vit/classifiers/checkpoints/chestxray/20260117_190122/best_vit_chestxray.pth',

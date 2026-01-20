@@ -59,7 +59,7 @@ def parse_args():
                         help='Diffusion start timestep')
     parser.add_argument('--T_purify', type=int, default=50,
                         help='Number of purification steps')
-    parser.add_argument('--eta', type=float, default=0.0,
+    parser.add_argument('--eta', type=float, default=1.0,
                         help='DDPM sampling eta (0=DDIM, 1=DDPM)')
     
     # 実行設定

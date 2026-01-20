@@ -1,21 +1,18 @@
 """
-Defense-GAN Adversarial Defense Evaluation for ChestX-ray Dataset (ViT Classifier) - FGSM Attack
+ChestX-ray Dataset - AutoAttack + Defense-GAN Defense (ViT Classifier)
+AutoAttackによる強力な敵対的攻撃に対するDefense-GAN防御の検証
+
+AutoAttack:
+- APGD-CE: Auto-PGD with cross-entropy loss
+- APGD-DLR: Auto-PGD with difference of logits ratio loss  
+- FAB: Fast Adaptive Boundary attack
+- Square: Square attack (query-based)
 
 Defense-GANは、GANの生成器を使って入力画像を「浄化」し、
 敵対的摂動を除去する防御手法です。
 
-浄化プロセス:
-1. 入力画像 x に対して、最適な潜在変数 z* を勾配降下法で探索
-2. z* から生成された画像 G(z*) を分類器への入力として使用
-
-ChestX-ray特有の考慮:
-- グレースケール画像（1チャンネル）→ Generator出力は1チャンネル
-- 分類器への入力は3チャンネル（RGB複製）
-- クラス: NORMAL (0), PNEUMONIA (1)
-
 実行例:
-python gan_fgsm_eval.py --epsilon 0.031 --use_defense
-python gan_fgsm_eval.py --epsilon 0.031 --rec_iters 500 --rec_lr 0.01
+python gan_autoattack_eval.py --epsilon 0.031 --rec_iters 150 --rec_rr 3 --gpu 0
 """
 
 import os
@@ -37,24 +34,34 @@ from sklearn.metrics import confusion_matrix
 import numpy as np
 from tqdm.auto import tqdm
 
+# AutoAttackのインポート
+try:
+    from autoattack import AutoAttack
+except ImportError:
+    print("AutoAttack not found. Install with: pip install git+https://github.com/fra31/auto-attack")
+    sys.exit(1)
+
 
 # ========== 引数パーサー ==========
 def parse_args():
-    parser = argparse.ArgumentParser(description='Defense-GAN Evaluation for ChestX-ray (ViT) - FGSM Attack')
+    parser = argparse.ArgumentParser(description='Defense-GAN Evaluation for ChestX-ray (ViT) - AutoAttack')
     
     # 攻撃設定
     parser.add_argument('--epsilon', type=float, default=8/255,
-                        help='FGSM perturbation epsilon')
+                        help='AutoAttack perturbation epsilon')
+    parser.add_argument('--norm', type=str, default='Linf', choices=['Linf', 'L2'],
+                        help='Attack norm')
+    parser.add_argument('--version', type=str, default='standard',
+                        choices=['standard', 'plus', 'rand'],
+                        help='AutoAttack version')
     
     # Defense-GAN設定
-    parser.add_argument('--use_defense', action='store_true', default=True,
-                        help='Enable Defense-GAN purification')
     parser.add_argument('--rec_iters', type=int, default=150,
-                        help='Number of reconstruction iterations (reduced from 500 for speed)')
+                        help='Number of reconstruction iterations')
     parser.add_argument('--rec_lr', type=float, default=0.01,
                         help='Learning rate for reconstruction')
     parser.add_argument('--rec_rr', type=int, default=3,
-                        help='Number of random restarts (reduced from 10 for speed)')
+                        help='Number of random restarts')
     parser.add_argument('--early_stop_threshold', type=float, default=0.01,
                         help='Early stopping threshold for reconstruction loss')
     
@@ -66,7 +73,7 @@ def parse_args():
                         default='/mnt/data1/gotou/projects/vit/classifiers/checkpoints/chestxray/20260117_190122/best_vit_chestxray.pth',
                         help='ViT Classifier checkpoint path')
     parser.add_argument('--output_dir', type=str,
-                        default='/mnt/data1/gotou/projects/vit/chestxray/gan/fgsm/results',
+                        default='/mnt/data1/gotou/projects/vit/chestxray/gan/autoattack/results',
                         help='Output directory')
     parser.add_argument('--cached_samples', type=str,
                         default='/mnt/data1/gotou/projects/vit/chestxray/correct_samples_balanced_500_vit.pt',
@@ -90,7 +97,6 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 
 # ========== Self-Attention ==========
 class SelfAttention(nn.Module):
-    """Self-Attention Module for capturing long-range dependencies"""
     def __init__(self, in_channels):
         super().__init__()
         self.in_channels = in_channels
@@ -120,7 +126,6 @@ class SelfAttention(nn.Module):
 
 # ========== ResNet Blocks ==========
 class ResBlockUp(nn.Module):
-    """Residual Block with Upsampling for Generator"""
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, 1, 1)
@@ -154,12 +159,6 @@ class ResBlockUp(nn.Module):
 
 # ========== Generator for ChestX-ray (Grayscale, nc=1) ==========
 class Generator(nn.Module):
-    """
-    ResNet-based Generator for 224x224 Grayscale images with Self-Attention
-    Structure: latent_dim -> 7x7 -> 14x14 -> 28x28 -> 56x56 -> 112x112 -> 224x224
-    
-    Note: nc=1 for grayscale ChestX-ray images
-    """
     def __init__(self, latent_dim=512, ngf=64, nc=1):
         super().__init__()
         self.latent_dim = latent_dim
@@ -205,20 +204,9 @@ class Generator(nn.Module):
         return h
 
 
-# ========== Defense-GAN Purification for ChestX-ray ==========
+# ========== Defense-GAN Purification ==========
 class DefenseGAN:
-    """
-    Defense-GAN for ChestX-ray: 敵対的画像をGANの生成器を使って浄化
-    
-    ChestX-ray特有の処理:
-    - Generator出力は1チャンネル（グレースケール）
-    - 分類器入力は3チャンネル（RGB複製）
-    - 最適化はグレースケール空間で行う
-    
-    最適化済み:
-    - 早期停止による高速化
-    - パラメータ削減による実用的な実行時間
-    """
+    """Defense-GAN for ChestX-ray"""
     def __init__(self, generator, latent_dim=512, rec_iters=150, rec_lr=0.01, 
                  rec_rr=3, early_stop_threshold=0.01, device='cuda'):
         self.generator = generator
@@ -231,44 +219,27 @@ class DefenseGAN:
         self.device = device
     
     def _rgb_to_gray(self, x):
-        """RGB画像をグレースケールに変換 (3ch -> 1ch)"""
-        # x: [B, 3, H, W] in [0, 1]
-        # 標準的なグレースケール変換
         r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
-        gray = 0.299 * r + 0.587 * g + 0.114 * b
-        return gray
+        return 0.299 * r + 0.587 * g + 0.114 * b
     
     def _gray_to_rgb(self, x):
-        """グレースケールをRGBに複製 (1ch -> 3ch)"""
-        # x: [B, 1, H, W] in [0, 1]
         return x.repeat(1, 3, 1, 1)
     
     def _to_tanh_space(self, x):
-        """[0,1] -> [-1,1]"""
         return x * 2 - 1
     
     def _from_tanh_space(self, x):
-        """[-1,1] -> [0,1]"""
         return (x + 1) / 2
     
     def reconstruct(self, x):
-        """
-        入力画像xを生成器で再構成 (バッチ単位)
-        x: (B, 3, H, W), [0,1]範囲
-        return: 再構成画像 (B, 3, H, W), [0,1]範囲
-        
-        最適化: 早期停止条件により収束したら即座に終了
-        """
         batch_size = x.size(0)
         
-        # RGB -> グレースケール -> tanh空間
-        x_gray = self._rgb_to_gray(x)  # [B, 1, H, W]
-        x_target = self._to_tanh_space(x_gray)  # [-1, 1]
+        x_gray = self._rgb_to_gray(x)
+        x_target = self._to_tanh_space(x_gray)
         
         best_z_list = [None] * batch_size
         best_loss_list = [float('inf')] * batch_size
         
-        # Multiple random restarts
         for r in range(self.rec_rr):
             z = torch.randn(batch_size, self.latent_dim, device=self.device, requires_grad=True)
             optimizer = torch.optim.Adam([z], lr=self.rec_lr, betas=(0.9, 0.999))
@@ -276,7 +247,7 @@ class DefenseGAN:
             for iter_idx in range(self.rec_iters):
                 optimizer.zero_grad()
                 
-                x_gen = self.generator(z)  # [B, 1, H, W] in [-1, 1]
+                x_gen = self.generator(z)
                 loss = F.mse_loss(x_gen, x_target, reduction='none')
                 loss = loss.view(batch_size, -1).mean(dim=1)
                 
@@ -284,11 +255,9 @@ class DefenseGAN:
                 total_loss.backward()
                 optimizer.step()
                 
-                # 早期停止: 全サンプルが閾値以下なら終了
                 if loss.max().item() < self.early_stop_threshold:
                     break
             
-            # Update best z for each sample
             with torch.no_grad():
                 x_gen = self.generator(z)
                 final_loss = F.mse_loss(x_gen, x_target, reduction='none')
@@ -299,19 +268,17 @@ class DefenseGAN:
                         best_loss_list[i] = final_loss[i].item()
                         best_z_list[i] = z[i].clone()
             
-            # 早期停止: 十分良い解が見つかったらリスタートを打ち切る
             if max(best_loss_list) < self.early_stop_threshold:
                 break
         
-        # Generate final reconstruction
         best_z = torch.stack([z if z is not None else torch.randn(self.latent_dim, device=self.device) 
                              for z in best_z_list])
         
         with torch.no_grad():
-            x_rec = self.generator(best_z)  # [B, 1, H, W] in [-1, 1]
-            x_rec = self._from_tanh_space(x_rec)  # [0, 1]
+            x_rec = self.generator(best_z)
+            x_rec = self._from_tanh_space(x_rec)
             x_rec = x_rec.clamp(0, 1)
-            x_rec = self._gray_to_rgb(x_rec)  # [B, 3, H, W]
+            x_rec = self._gray_to_rgb(x_rec)
         
         return x_rec
 
@@ -325,16 +292,12 @@ class ViTClassifierWrapper(nn.Module):
         self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
     
     def forward(self, x):
-        mean = self.mean.to(x.device)
-        std = self.std.to(x.device)
-        x_norm = (x - mean) / std
+        x_norm = (x - self.mean) / self.std
         return self.classifier(x_norm)
 
 
 # ========== モデル読み込み ==========
 def load_classifier(args, device):
-    """ViT分類器を読み込み"""
-    # ViT分類器（2クラス: NORMAL, PNEUMONIA）
     classifier = models.vit_b_16(weights=None)
     in_features = classifier.heads.head.in_features
     classifier.heads.head = nn.Sequential(
@@ -355,15 +318,12 @@ def load_classifier(args, device):
 
 
 def load_generator(args, device):
-    """GAN生成器を読み込み (ChestX-ray用、グレースケール)"""
     checkpoint = torch.load(args.gan_ckpt, map_location=device)
     
-    # パラメータ読み込み
     latent_dim = 512
     ngf = 64
-    nc = 1  # グレースケール
+    nc = 1
     
-    # チェックポイントから設定を取得
     if 'args' in checkpoint:
         config = checkpoint['args']
         latent_dim = config.get('latent_dim', 512)
@@ -371,7 +331,6 @@ def load_generator(args, device):
     
     generator = Generator(latent_dim=latent_dim, ngf=ngf, nc=nc).to(device)
     
-    # 重みを読み込む
     if 'generator_state_dict' in checkpoint:
         generator.load_state_dict(checkpoint['generator_state_dict'], strict=False)
         print(f"Loaded generator (normal weights) from {args.gan_ckpt}")
@@ -393,38 +352,17 @@ def load_generator(args, device):
 
 # ========== データ読み込み ==========
 def load_cached_samples(cached_path):
-    """キャッシュされたサンプルを読み込み（ViT分類器で正しく分類されたサンプル）"""
     print(f"\nLoading cached samples from: {cached_path}")
     cached = torch.load(cached_path, map_location='cpu')
     x_test = cached['x_test']
     y_test = cached['y_test']
     classes = cached.get('classes', ['NORMAL', 'PNEUMONIA'])
     print(f"Loaded {len(x_test)} correctly classified samples")
-    print(f"  x_test shape: {x_test.shape}")
-    print(f"  y_test shape: {y_test.shape}")
-    print(f"  Classes: {classes}")
     return x_test, y_test, classes
-
-
-# ========== FGSM攻撃 ==========
-def fgsm_attack(model, x, y, epsilon, device):
-    """FGSM攻撃"""
-    x = x.clone().to(device)
-    x.requires_grad = True
-    
-    outputs = model(x)
-    loss = F.cross_entropy(outputs, y.to(device))
-    loss.backward()
-    
-    x_adv = x + epsilon * x.grad.sign()
-    x_adv = torch.clamp(x_adv, 0, 1)
-    
-    return x_adv.detach()
 
 
 # ========== 精度計算 ==========
 def get_accuracy(model, x, y, bs=32, device=None):
-    """モデルの精度を計算"""
     if device is None:
         device = next(model.parameters()).device
     
@@ -444,21 +382,12 @@ def get_accuracy(model, x, y, bs=32, device=None):
     return correct / len(x)
 
 
-# ========== Defense-GAN浄化の精度計算と予測取得（統合版）==========
-def get_accuracy_and_predictions_with_defense(model, x, y, defense_gan, bs=4, device=None):
-    """
-    Defense-GANによる浄化後の精度と予測を同時に計算（重複計算を削減）
-    
-    Returns:
-        accuracy: 精度
-        predictions: 予測ラベル (numpy array)
-    """
+def get_accuracy_with_defense(model, x, y, defense_gan, bs=4, device=None):
     if device is None:
         device = next(model.parameters()).device
     
     n_batches = (len(x) + bs - 1) // bs
     correct = 0
-    all_preds = []
     
     for i in tqdm(range(n_batches), desc="Defense-GAN Purification"):
         start_idx = i * bs
@@ -466,30 +395,17 @@ def get_accuracy_and_predictions_with_defense(model, x, y, defense_gan, bs=4, de
         x_batch = x[start_idx:end_idx].to(device)
         y_batch = y[start_idx:end_idx].to(device)
         
-        # Defense-GANで浄化
         x_purified = defense_gan.reconstruct(x_batch)
         
         with torch.no_grad():
             outputs = model(x_purified)
             preds = outputs.argmax(dim=1)
             correct += (preds == y_batch).sum().item()
-            all_preds.append(preds.cpu())
     
-    accuracy = correct / len(x)
-    predictions = torch.cat(all_preds).numpy()
-    
-    return accuracy, predictions
+    return correct / len(x)
 
 
-def get_accuracy_with_defense(model, x, y, defense_gan, bs=4, device=None):
-    """Defense-GANによる浄化後の精度を計算（互換性維持）"""
-    accuracy, _ = get_accuracy_and_predictions_with_defense(model, x, y, defense_gan, bs, device)
-    return accuracy
-
-
-# ========== 予測取得 ==========
 def get_predictions(model, x, bs=32, device=None):
-    """モデルの予測を取得"""
     if device is None:
         device = next(model.parameters()).device
     
@@ -508,14 +424,28 @@ def get_predictions(model, x, bs=32, device=None):
 
 
 def get_predictions_with_defense(model, x, y, defense_gan, bs=4, device=None):
-    """Defense-GANによる浄化後の予測を取得（互換性維持）"""
-    _, predictions = get_accuracy_and_predictions_with_defense(model, x, y, defense_gan, bs, device)
-    return predictions
+    if device is None:
+        device = next(model.parameters()).device
+    
+    n_batches = (len(x) + bs - 1) // bs
+    preds = []
+    
+    for i in tqdm(range(n_batches), desc="Getting predictions with defense"):
+        start_idx = i * bs
+        end_idx = min((i + 1) * bs, len(x))
+        x_batch = x[start_idx:end_idx].to(device)
+        
+        x_purified = defense_gan.reconstruct(x_batch)
+        
+        with torch.no_grad():
+            outputs = model(x_purified)
+            preds.append(outputs.argmax(dim=1).cpu())
+    
+    return torch.cat(preds).numpy()
 
 
 # ========== 混同行列出力 ==========
 def print_confusion_matrix(y_true, y_pred, title, classes=None):
-    """混同行列をテキスト出力"""
     cm = confusion_matrix(y_true, y_pred)
     if cm.size == 4:
         tn, fp, fn, tp = cm.ravel()
@@ -536,52 +466,24 @@ def print_confusion_matrix(y_true, y_pred, title, classes=None):
     return {}
 
 
-# ========== FGSM攻撃実行 ==========
-def run_fgsm_attack(model, x_test, y_test, epsilon, device, batch_size=32):
-    """FGSM攻撃を実行して敵対的サンプルを生成"""
-    print(f"\nRunning FGSM attack with epsilon={epsilon:.4f}...")
-    
-    n_batches = (len(x_test) + batch_size - 1) // batch_size
-    x_adv_list = []
-    
-    for i in tqdm(range(n_batches), desc="FGSM Attack"):
-        start_idx = i * batch_size
-        end_idx = min((i + 1) * batch_size, len(x_test))
-        x_batch = x_test[start_idx:end_idx].to(device)
-        y_batch = y_test[start_idx:end_idx].to(device)
-        
-        x_adv_batch = fgsm_attack(model, x_batch, y_batch, epsilon, device)
-        x_adv_list.append(x_adv_batch.cpu())
-    
-    x_adv = torch.cat(x_adv_list, dim=0)
-    print(f"Generated {len(x_adv)} adversarial samples")
-    
-    return x_adv
-
-
 # ========== サンプル画像保存 ==========
-def save_sample_images(x_clean, x_adv, x_purified_clean, x_purified_adv, 
-                       y_true, classes, save_dir, max_samples=10):
-    """サンプル画像を保存"""
+def save_sample_images(x_clean, x_adv, x_purified, y_true, preds_clean, preds_adv, preds_defended,
+                       classes, save_dir, max_samples=10):
     os.makedirs(save_dir, exist_ok=True)
     n = min(len(x_clean), max_samples)
     
     for i in range(n):
         label = int(y_true[i])
         label_name = classes[label] if classes else str(label)
+        pred_clean = classes[preds_clean[i]] if classes else str(preds_clean[i])
+        pred_adv = classes[preds_adv[i]] if classes else str(preds_adv[i])
+        pred_def = classes[preds_defended[i]] if classes else str(preds_defended[i])
         
-        # 4枚を並べて保存: Clean, Clean+GAN, Adv, Adv+GAN
-        quad = torch.cat([
-            x_clean[i:i+1],
-            x_purified_clean[i:i+1],
-            x_adv[i:i+1],
-            x_purified_adv[i:i+1]
-        ], dim=0)
-        grid = make_grid(quad, nrow=4, padding=5, pad_value=1.0)
-        save_image(grid, os.path.join(save_dir, f"{i:04d}_{label_name}.png"))
+        quad = torch.cat([x_clean[i:i+1], x_adv[i:i+1], x_purified[i:i+1]], dim=0)
+        grid = make_grid(quad, nrow=3, padding=5, pad_value=1.0)
+        save_image(grid, os.path.join(save_dir, f"{i:04d}_{label_name}_clean{pred_clean}_adv{pred_adv}_def{pred_def}.png"))
     
     print(f"Saved {n} sample images to {save_dir}")
-    print(f"  Format: [Clean | Clean+GAN | Adversarial | Adv+GAN]")
 
 
 # ========== メイン ==========
@@ -600,7 +502,7 @@ def main():
     
     # 出力ディレクトリ
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join(args.output_dir, f"fgsm_eps{args.epsilon:.4f}_{timestamp}")
+    log_dir = os.path.join(args.output_dir, f"autoattack_eps{args.epsilon:.4f}_{timestamp}")
     os.makedirs(log_dir, exist_ok=True)
     print(f"Output directory: {log_dir}")
     
@@ -619,23 +521,18 @@ def main():
         device=device
     )
     
-    # 推定実行時間を表示
-    estimated_time_per_sample = args.rec_iters * args.rec_rr * 0.008  # 約8ms/iteration
-    estimated_total = estimated_time_per_sample * 500 * 4  # 4回の浄化処理
-    print(f"Estimated time: ~{estimated_total/60:.1f} minutes (with early stopping, likely faster)")
-    
-    # ラッパー作成
     classifier_model = ViTClassifierWrapper(classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
     
     # データ読み込み
     x_test, y_test, classes = load_cached_samples(args.cached_samples)
-    print(f"Classes: {classes}")
     
     # ==================== 評価開始 ====================
     print(f"\n{'='*70}")
-    print("FGSM Attack + Defense-GAN Evaluation (ViT Classifier)")
+    print("AutoAttack + Defense-GAN Evaluation (ViT Classifier)")
     print(f"{'='*70}")
     print(f"Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
+    print(f"Norm: {args.norm}")
+    print(f"Version: {args.version}")
     print(f"Defense-GAN: rec_iters={args.rec_iters}, rec_lr={args.rec_lr}, rec_rr={args.rec_rr}")
     print(f"Samples: {len(x_test)}")
     print(f"{'='*70}")
@@ -650,30 +547,31 @@ def main():
     
     # ========== 2. クリーン画像を浄化した後の精度 ==========
     print("\n[2/4] Evaluating clean images with Defense-GAN purification...")
-    clean_purified_acc, pred_clean_purified = get_accuracy_and_predictions_with_defense(
-        classifier_model, x_test, y_test, defense_gan, bs=4, device=device)
+    clean_purified_acc = get_accuracy_with_defense(classifier_model, x_test, y_test, defense_gan, bs=4, device=device)
     print(f"Clean accuracy (with Defense-GAN): {clean_purified_acc:.4f}")
     results['clean_acc_with_gan'] = clean_purified_acc
     
-    # ========== 3. FGSM攻撃 & 敵対的画像の精度（防御なし） ==========
-    print("\n[3/4] Running FGSM attack and evaluating adversarial images...")
+    # ========== 3. AutoAttack ==========
+    print("\n[3/4] Running AutoAttack...")
     start_time = time.time()
-    x_adv = run_fgsm_attack(classifier_model, x_test, y_test, args.epsilon, device, args.batch_size)
+    
+    adversary = AutoAttack(classifier_model, norm=args.norm, eps=args.epsilon, version=args.version, device=device)
+    x_adv = adversary.run_standard_evaluation(x_test.to(device), y_test.to(device), bs=args.batch_size)
+    
     attack_time = time.time() - start_time
+    print(f"AutoAttack completed in {attack_time:.2f}s")
     
     adv_acc_no_defense = get_accuracy(classifier_model, x_adv, y_test, bs=args.batch_size, device=device)
     print(f"Adversarial accuracy (no defense): {adv_acc_no_defense:.4f}")
     results['adv_acc_no_defense'] = adv_acc_no_defense
     results['attack_time'] = attack_time
     
-    # ========== 4. 敵対的画像を浄化した後の精度（防御あり） ==========
+    # ========== 4. 敵対的画像を浄化した後の精度 ==========
     print("\n[4/4] Evaluating adversarial images with Defense-GAN purification...")
-    adv_defended_acc, pred_adv_defended = get_accuracy_and_predictions_with_defense(
-        classifier_model, x_adv, y_test, defense_gan, bs=4, device=device)
+    adv_defended_acc = get_accuracy_with_defense(classifier_model, x_adv, y_test, defense_gan, bs=4, device=device)
     print(f"Adversarial accuracy (with Defense-GAN): {adv_defended_acc:.4f}")
     results['adv_acc_with_gan'] = adv_defended_acc
     
-    # 防御効果
     defense_improvement = adv_defended_acc - adv_acc_no_defense
     results['defense_improvement'] = defense_improvement
     
@@ -682,15 +580,14 @@ def main():
     print("FINAL RESULTS")
     print(f"{'='*70}")
     print(f"Classifier: ViT-B/16")
-    print(f"Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
+    print(f"Attack: AutoAttack ({args.version}), Epsilon: {args.epsilon:.4f}, Norm: {args.norm}")
     print(f"Defense-GAN: rec_iters={args.rec_iters}, rec_lr={args.rec_lr}, rec_rr={args.rec_rr}")
-    print(f"Note: Generator is trained on grayscale images")
     print(f"-"*70)
     print(f"Clean Accuracy:")
     print(f"  ViT classifier only:       {results['clean_acc_classifier']:.4f}")
     print(f"  With Defense-GAN:          {results['clean_acc_with_gan']:.4f}")
     print(f"-"*70)
-    print(f"Adversarial Accuracy (FGSM):")
+    print(f"Adversarial Accuracy (AutoAttack):")
     print(f"  Without defense:           {results['adv_acc_no_defense']:.4f}")
     print(f"  With Defense-GAN:          {results['adv_acc_with_gan']:.4f}")
     print(f"  Defense improvement:       {results['defense_improvement']:+.4f}")
@@ -703,69 +600,62 @@ def main():
     print("Confusion Matrices")
     print(f"{'='*70}")
     
-    # 予測取得（Defense-GAN処理済みの予測は既に取得済み）
     pred_clean = get_predictions(classifier_model, x_test, bs=args.batch_size, device=device)
     pred_adv_no_def = get_predictions(classifier_model, x_adv, bs=args.batch_size, device=device)
-    # pred_clean_purified と pred_adv_defended は上で既に取得済み
+    pred_adv_defended = get_predictions_with_defense(classifier_model, x_adv, y_test, defense_gan, bs=4, device=device)
     
     y_true = y_test.cpu().numpy()
     
     cm_clean = print_confusion_matrix(y_true, pred_clean, "1. Clean Images (ViT classifier only)", classes)
-    cm_clean_purified = print_confusion_matrix(y_true, pred_clean_purified, "2. Clean Images (with Defense-GAN)", classes)
-    cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "3. Adversarial Images (No Defense)", classes)
-    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "4. Adversarial Images (with Defense-GAN)", classes)
+    cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "2. AutoAttack Images (No Defense)", classes)
+    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "3. AutoAttack Images (with Defense-GAN)", classes)
     
-    results['confusion_matrices'] = {
-        'clean': cm_clean,
-        'clean_purified': cm_clean_purified,
-        'adv_no_defense': cm_adv_no_def,
-        'adv_defended': cm_adv_defended
-    }
-    
-    # ==================== 浄化画像を生成して保存 ====================
+    # ==================== サンプル画像保存 ====================
     print("\nGenerating purified samples for visualization...")
     n_samples = min(10, len(x_test))
-    x_purified_clean = []
-    x_purified_adv = []
+    x_purified = []
     
     for i in range(n_samples):
-        x_purified_clean.append(defense_gan.reconstruct(x_test[i:i+1].to(device)).cpu())
-        x_purified_adv.append(defense_gan.reconstruct(x_adv[i:i+1].to(device)).cpu())
+        x_pur = defense_gan.reconstruct(x_adv[i:i+1].to(device))
+        x_purified.append(x_pur.cpu())
     
-    x_purified_clean = torch.cat(x_purified_clean, dim=0)
-    x_purified_adv = torch.cat(x_purified_adv, dim=0)
+    x_purified = torch.cat(x_purified, dim=0)
     
     save_sample_images(
-        x_test[:n_samples].cpu(), 
+        x_test[:n_samples].cpu(),
         x_adv[:n_samples].cpu(),
-        x_purified_clean,
-        x_purified_adv,
-        y_test[:n_samples].cpu().numpy(), 
+        x_purified,
+        y_test[:n_samples].cpu().numpy(),
+        pred_clean[:n_samples],
+        pred_adv_no_def[:n_samples],
+        pred_adv_defended[:n_samples],
         classes,
         os.path.join(log_dir, 'samples')
     )
     
-    # ==================== 敵対的サンプル保存 ====================
+    # ==================== 結果保存 ====================
     torch.save({
         'x_clean': x_test.cpu(),
         'x_adv': x_adv.cpu(),
         'y': y_test.cpu(),
         'epsilon': args.epsilon,
+        'attack': 'autoattack',
+        'version': args.version,
+        'norm': args.norm,
     }, os.path.join(log_dir, 'adversarial_samples.pt'))
-    print(f"Saved adversarial samples to: {os.path.join(log_dir, 'adversarial_samples.pt')}")
     
-    # ==================== サマリー保存 ====================
+    # サマリー保存
     summary_path = os.path.join(log_dir, 'summary.txt')
     with open(summary_path, 'w') as f:
         f.write("="*70 + "\n")
-        f.write("ChestX-ray - FGSM Attack + Defense-GAN (ViT Classifier)\n")
+        f.write("ChestX-ray - AutoAttack + Defense-GAN (ViT Classifier)\n")
         f.write("="*70 + "\n\n")
         f.write(f"Classifier: ViT-B/16\n")
-        f.write(f"Attack: FGSM\n")
+        f.write(f"Attack: AutoAttack ({args.version})\n")
         f.write(f"Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)\n")
+        f.write(f"Norm: {args.norm}\n")
         f.write(f"Defense-GAN: rec_iters={args.rec_iters}, rec_lr={args.rec_lr}, rec_rr={args.rec_rr}\n")
-        f.write(f"Samples: {len(x_test)}\n")
-        f.write(f"Note: Generator is trained on grayscale images\n\n")
+        f.write(f"Samples: {len(x_test)}\n\n")
         
         f.write("-"*70 + "\n")
         f.write("RESULTS\n")
@@ -775,44 +665,28 @@ def main():
         f.write(f"  ViT classifier only:       {results['clean_acc_classifier']:.4f}\n")
         f.write(f"  With Defense-GAN:          {results['clean_acc_with_gan']:.4f}\n\n")
         
-        f.write("Adversarial Accuracy (FGSM):\n")
+        f.write("Adversarial Accuracy (AutoAttack):\n")
         f.write(f"  Without defense:           {results['adv_acc_no_defense']:.4f}\n")
         f.write(f"  With Defense-GAN:          {results['adv_acc_with_gan']:.4f}\n")
         f.write(f"  Defense improvement:       {results['defense_improvement']:+.4f}\n\n")
         
-        f.write(f"Attack time: {results['attack_time']:.2f}s\n\n")
-        
-        f.write("-"*70 + "\n")
-        f.write("CONFUSION MATRICES\n")
-        f.write("-"*70 + "\n\n")
-        
-        for name, cm in [("Clean (ViT Classifier)", cm_clean), 
-                         ("Clean (with Defense-GAN)", cm_clean_purified),
-                         ("Adversarial (No Defense)", cm_adv_no_def),
-                         ("Adversarial (with Defense-GAN)", cm_adv_defended)]:
-            if cm:
-                f.write(f"{name}:\n")
-                f.write(f"  TN: {cm['tn']:4d}  FP: {cm['fp']:4d}\n")
-                f.write(f"  FN: {cm['fn']:4d}  TP: {cm['tp']:4d}\n")
-                f.write(f"  Accuracy: {cm['accuracy']:.4f}\n")
-                f.write(f"  Precision: {cm['precision']:.4f}, Recall: {cm['recall']:.4f}, F1: {cm['f1']:.4f}\n\n")
+        f.write(f"Attack time: {results['attack_time']:.2f}s\n")
     
-    # JSON形式でも保存
+    # JSON保存
     results_json = {
         'classifier': 'ViT-B/16',
-        'args': vars(args),
-        'clean_acc_classifier': results['clean_acc_classifier'],
-        'clean_acc_with_gan': results['clean_acc_with_gan'],
-        'adv_acc_no_defense': results['adv_acc_no_defense'],
-        'adv_acc_with_gan': results['adv_acc_with_gan'],
-        'defense_improvement': results['defense_improvement'],
-        'attack_time': results['attack_time'],
+        'attack': 'autoattack',
+        'version': args.version,
+        'norm': args.norm,
+        'epsilon': args.epsilon,
+        'defense_gan_rec_iters': args.rec_iters,
+        'defense_gan_rec_rr': args.rec_rr,
+        **results
     }
     with open(os.path.join(log_dir, 'results.json'), 'w') as f:
         json.dump(results_json, f, indent=2)
     
     print(f"\n✅ Results saved to: {log_dir}")
-    print(f"✅ Summary: {summary_path}")
     
     return results
 

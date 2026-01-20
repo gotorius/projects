@@ -66,7 +66,7 @@ def main():
     
     # パス設定
     test_data_dir = '/mnt/data1/Public/MedImages/CellData/chest_xray/test'
-    clf_ckpt = '/mnt/data1/gotou/projects/classifiers/vit/checkpoints/chestxray/20260117_190122/best_vit_chestxray.pth'
+    clf_ckpt = '/mnt/data1/gotou/projects/vit/classifiers/checkpoints/chestxray/20260117_190122/best_vit_chestxray.pth'
     output_dir = '/mnt/data1/gotou/projects/chestxray/vit'
     output_path = os.path.join(output_dir, 'correct_samples_balanced_500_vit.pt')
     
