@@ -341,7 +341,7 @@ def get_accuracy(model, x, y, bs=32, device=None):
     correct = 0
     
     with torch.no_grad():
-        for i in range(n_batches):
+        for i in tqdm(range(n_batches), desc="Computing accuracy", leave=False):
             start_idx = i * bs
             end_idx = min((i + 1) * bs, len(x))
             x_batch = x[start_idx:end_idx].to(device)
@@ -363,7 +363,7 @@ def get_predictions(model, x, bs=32, device=None):
     preds = []
     
     with torch.no_grad():
-        for i in range(n_batches):
+        for i in tqdm(range(n_batches), desc="Getting predictions", leave=False):
             start_idx = i * bs
             end_idx = min((i + 1) * bs, len(x))
             x_batch = x[start_idx:end_idx].to(device)
@@ -579,8 +579,9 @@ def main():
     x_purified_adv = []
     
     with torch.no_grad():
-        for i in range(n_samples):
+        for i in tqdm(range(n_samples), desc="Purifying clean samples"):
             x_purified_clean.append(purifier(x_test[i:i+1].to(device)).cpu())
+        for i in tqdm(range(n_samples), desc="Purifying adversarial samples"):
             x_purified_adv.append(purifier(x_adv[i:i+1].to(device)).cpu())
     
     x_purified_clean = torch.cat(x_purified_clean, dim=0)
