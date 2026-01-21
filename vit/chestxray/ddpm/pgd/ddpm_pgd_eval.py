@@ -63,9 +63,9 @@ def parse_args():
                         help='Use random start for PGD')
     
     # DDPM浄化設定
-    parser.add_argument('--start_t', type=int, default=80,
+    parser.add_argument('--start_t', type=int, default=280,
                         help='Diffusion start timestep')
-    parser.add_argument('--T_purify', type=int, default=50,
+    parser.add_argument('--T_purify', type=int, default=300,
                         help='Number of purification steps')
     parser.add_argument('--eta', type=float, default=0.0,
                         help='DDPM sampling eta (0=DDIM, 1=DDPM)')
