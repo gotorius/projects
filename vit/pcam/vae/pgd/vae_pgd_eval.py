@@ -1,26 +1,17 @@
 """
-ChestX-ray Dataset - PGD Attack + Guided-Diffusion (ImageNet Pretrained) Defense (ViT Classifier)
-DiffPureスタイルの敵対的防御検証スクリプト
+PCam Dataset - VAE (MagNet-style) PGD Evaluation (ViT Classifier)
 
-評価内容:
-1. クリーン画像の分類精度
-2. クリーン画像を浄化した後の分類精度
-3. PGD敵対的画像の分類精度（防御なし）
-4. PGD敵対的画像を浄化した後の分類精度（防御あり）
-"""
+VAEによるMagNet-style防御に対してPGD攻撃を評価するスクリプト。
+PCamデータセット用のViT分類器を使用。
 
-"""
-# 基本実行（デフォルト設定）
-python imagenet_pgd_eval.py
+Reference:
+    "MagNet: a Two-Pronged Defense against Adversarial Examples"
+    Meng & Chen, CCS 2017
+    https://arxiv.org/abs/1705.09064
 
-# パラメータ指定
-python imagenet_pgd_eval.py \
-    --epsilon 0.03137 \
-    --alpha 0.00784 \
-    --pgd_steps 10 \
-    --start_t 80 \
-    --T_purify 50 \
-    --gpu 0
+Usage:
+    python vae_pgd_eval.py --epsilon 0.031 --alpha 0.007 --pgd_steps 10 --gpu 0
+    python vae_pgd_eval.py --epsilon 0.062 --alpha 0.015 --pgd_steps 20 --gpu 0
 """
 
 import os
@@ -29,73 +20,61 @@ import argparse
 import random
 import time
 import json
+from datetime import datetime
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
-from torchvision import transforms, datasets
 from torchvision.utils import save_image, make_grid
 from sklearn.metrics import confusion_matrix
-from pathlib import Path
 import numpy as np
-from PIL import Image
-from datetime import datetime
 from tqdm.auto import tqdm
 
-# Guided-diffusionモジュールのインポート
-sys.path.insert(0, '/mnt/data1/gotou/kaggle/guided-diffusion')
-from guided_diffusion.script_util import (
-    model_and_diffusion_defaults,
-    create_model_and_diffusion,
-)
 
-
-# ========== 引数パーサー ==========
 def parse_args():
-    parser = argparse.ArgumentParser(description='ChestX-ray PGD Attack + Guided-Diffusion Defense (ViT)')
+    parser = argparse.ArgumentParser(
+        description='VAE (MagNet-style) + PGD Attack Evaluation for PCam (ViT Classifier)',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     
-    # 攻撃設定
+    # 攻撃パラメータ
     parser.add_argument('--epsilon', type=float, default=8/255,
-                        help='PGD perturbation epsilon (pixel scale 0-1)')
+                        help='PGD攻撃の最大摂動量 (0-1スケール)')
     parser.add_argument('--alpha', type=float, default=2/255,
-                        help='PGD step size (pixel scale 0-1)')
+                        help='PGD攻撃のステップサイズ (0-1スケール)')
     parser.add_argument('--pgd_steps', type=int, default=10,
-                        help='Number of PGD iterations')
+                        help='PGD攻撃のステップ数')
     parser.add_argument('--random_start', action='store_true', default=True,
-                        help='Use random start for PGD')
+                        help='PGD攻撃でランダムスタートを使用')
     
-    # 拡散モデル浄化設定
-    parser.add_argument('--start_t', type=int, default=280,
-                        help='Diffusion start timestep')
-    parser.add_argument('--T_purify', type=int, default=300,
-                        help='Number of purification steps')
-    parser.add_argument('--eta', type=float, default=0.0,
-                        help='DDIM sampling eta (0=deterministic)')
+    # VAEパラメータ
+    parser.add_argument('--latent_dim', type=int, default=512,
+                        help='VAEの潜在次元')
+    parser.add_argument('--base_ch', type=int, default=64,
+                        help='VAEのベースチャンネル数')
     
-    # 実行設定
-    parser.add_argument('--batch_size', type=int, default=8,
-                        help='Batch size for evaluation')
+    # 実行パラメータ
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='バッチサイズ')
     parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed')
+                        help='乱数シード')
     
-    # パス設定
+    # パス
     parser.add_argument('--cached_samples', type=str,
-                        default='/mnt/data1/gotou/projects/vit/chestxray/correct_samples_balanced_500_vit.pt',
-                        help='Path to cached samples (.pt file)')
-    parser.add_argument('--diffusion_ckpt', type=str, 
-                        default='/mnt/data1/gotou/kaggle/guided-diffusion/256x256_diffusion_uncond.pt',
-                        help='Guided-Diffusion checkpoint path')
+                        default='/mnt/data1/gotou/projects/vit/pcam/correct_samples_balanced_500_vit.pt',
+                        help='キャッシュされたサンプルファイル')
+    parser.add_argument('--vae_ckpt', type=str,
+                        default='/mnt/data1/gotou/projects/resnet/pcam/vae/checkpoints_v2/20260108_165711/best_model.pth',
+                        help='VAEチェックポイントファイル')
     parser.add_argument('--clf_ckpt', type=str,
-                        default='/mnt/data1/gotou/projects/vit/classifiers/checkpoints/chestxray/20260117_190122/best_vit_chestxray.pth',
-                        help='ViT Classifier checkpoint path')
+                        default='/mnt/data1/gotou/projects/vit/classifiers/checkpoints/pcam/20260117_210505/best_vit_pcam.pth',
+                        help='ViT分類器チェックポイントファイル')
     parser.add_argument('--output_dir', type=str,
-                        default='/mnt/data1/gotou/projects/vit/chestxray/imagenet/pgd/results',
-                        help='Output directory')
-    
-    # GPU設定
+                        default='/mnt/data1/gotou/projects/vit/pcam/vae/pgd/results',
+                        help='結果出力ディレクトリ')
     parser.add_argument('--gpu', type=int, default=0,
-                        help='GPU ID to use')
+                        help='使用するGPU番号')
     
     return parser.parse_args()
 
@@ -105,134 +84,208 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
+# ========== Residual Block ==========
+class ResBlockEncoder(nn.Module):
+    """Residual Block for Encoder"""
+    def __init__(self, in_ch, out_ch, downsample=True):
+        super().__init__()
+        self.downsample = downsample
+        
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, 1, 1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1)
+        self.bn1 = nn.BatchNorm2d(in_ch)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+    
+    def forward(self, x):
+        h = F.leaky_relu(self.bn1(x), 0.2)
+        h = self.conv1(h)
+        h = F.leaky_relu(self.bn2(h), 0.2)
+        h = self.conv2(h)
+        
+        x = self.skip(x)
+        
+        if self.downsample:
+            h = F.avg_pool2d(h, 2)
+            x = F.avg_pool2d(x, 2)
+        
+        return h + x
+
+
+class ResBlockDecoder(nn.Module):
+    """Residual Block for Decoder"""
+    def __init__(self, in_ch, out_ch, upsample=True):
+        super().__init__()
+        self.upsample = upsample
+        
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, 1, 1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1)
+        self.bn1 = nn.BatchNorm2d(in_ch)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+    
+    def forward(self, x):
+        h = F.relu(self.bn1(x))
+        if self.upsample:
+            h = F.interpolate(h, scale_factor=2, mode='bilinear', align_corners=False)
+        h = self.conv1(h)
+        h = F.relu(self.bn2(h))
+        h = self.conv2(h)
+        
+        if self.upsample:
+            x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = self.skip(x)
+        
+        return h + x
+
+
+# ========== Encoder (RGB入力) ==========
+class Encoder(nn.Module):
+    """Encoder for RGB images: 224 -> 7 -> latent"""
+    def __init__(self, img_channels=3, base_ch=64, latent_dim=512):
+        super().__init__()
+        
+        self.conv_in = nn.Conv2d(img_channels, base_ch, 3, 1, 1)
+        
+        # 224 -> 112 -> 56 -> 28 -> 14 -> 7
+        self.block1 = ResBlockEncoder(base_ch, base_ch, downsample=True)
+        self.block2 = ResBlockEncoder(base_ch, base_ch * 2, downsample=True)
+        self.block3 = ResBlockEncoder(base_ch * 2, base_ch * 4, downsample=True)
+        self.block4 = ResBlockEncoder(base_ch * 4, base_ch * 8, downsample=True)
+        self.block5 = ResBlockEncoder(base_ch * 8, base_ch * 8, downsample=True)
+        
+        self.bn_out = nn.BatchNorm2d(base_ch * 8)
+        
+        # Latent projections
+        self.fc_mu = nn.Linear(base_ch * 8 * 7 * 7, latent_dim)
+        self.fc_logvar = nn.Linear(base_ch * 8 * 7 * 7, latent_dim)
+    
+    def forward(self, x):
+        h = self.conv_in(x)
+        h = self.block1(h)
+        h = self.block2(h)
+        h = self.block3(h)
+        h = self.block4(h)
+        h = self.block5(h)
+        h = F.leaky_relu(self.bn_out(h), 0.2)
+        
+        h = h.view(h.size(0), -1)
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        
+        return mu, logvar
+
+
+# ========== Decoder (RGB出力) ==========
+class Decoder(nn.Module):
+    """Decoder for RGB images: latent -> 7 -> 224"""
+    def __init__(self, img_channels=3, base_ch=64, latent_dim=512):
+        super().__init__()
+        self.base_ch = base_ch
+        
+        self.fc = nn.Linear(latent_dim, base_ch * 8 * 7 * 7)
+        
+        # 7 -> 14 -> 28 -> 56 -> 112 -> 224
+        self.block1 = ResBlockDecoder(base_ch * 8, base_ch * 8, upsample=True)
+        self.block2 = ResBlockDecoder(base_ch * 8, base_ch * 4, upsample=True)
+        self.block3 = ResBlockDecoder(base_ch * 4, base_ch * 2, upsample=True)
+        self.block4 = ResBlockDecoder(base_ch * 2, base_ch, upsample=True)
+        self.block5 = ResBlockDecoder(base_ch, base_ch, upsample=True)
+        
+        self.bn_out = nn.BatchNorm2d(base_ch)
+        self.conv_out = nn.Conv2d(base_ch, img_channels, 3, 1, 1)
+    
+    def forward(self, z):
+        h = self.fc(z)
+        h = h.view(-1, self.base_ch * 8, 7, 7)
+        
+        h = self.block1(h)
+        h = self.block2(h)
+        h = self.block3(h)
+        h = self.block4(h)
+        h = self.block5(h)
+        
+        h = F.relu(self.bn_out(h))
+        h = self.conv_out(h)
+        
+        return torch.sigmoid(h)
+
+
+# ========== VAE ==========
+class VAE(nn.Module):
+    """VAE for RGB images"""
+    def __init__(self, img_channels=3, base_ch=64, latent_dim=512):
+        super().__init__()
+        self.encoder = Encoder(img_channels, base_ch, latent_dim)
+        self.decoder = Decoder(img_channels, base_ch, latent_dim)
+        self.latent_dim = latent_dim
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def forward(self, x):
+        mu, logvar = self.encoder(x)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decoder(z)
+        return recon, mu, logvar
+    
+    def reconstruct(self, x):
+        """再構成のみ（MagNet防御用）- 決定論的"""
+        mu, _ = self.encoder(x)
+        return self.decoder(mu)
+
+
+# ========== VAE Purifier (MagNet-style) ==========
+class VAEPurifier(nn.Module):
+    """VAEで画像を再構成して敵対的摂動を除去（RGB直接処理）"""
+    def __init__(self, vae, device):
+        super().__init__()
+        self.vae = vae
+        self.device = device
+    
+    def forward(self, x_rgb):
+        """
+        RGB画像 [0,1] を浄化
+        x_rgb: (B, 3, H, W), [0, 1]
+        return: 浄化されたRGB画像 (B, 3, H, W), [0, 1]
+        """
+        self.vae.eval()
+        with torch.no_grad():
+            x_recon = self.vae.reconstruct(x_rgb)
+        return x_recon
+
+
 # ========== ViT分類器ラッパー ==========
 class ViTClassifierWrapper(nn.Module):
-    """ViT分類器のラッパー
-    入力: [0,1]のRGB画像 (任意サイズ)
-    出力: 2クラスロジット
-    """
-    def __init__(self, classifier, mean, std, input_size=224):
+    def __init__(self, classifier, mean, std):
         super().__init__()
         self.classifier = classifier
-        self.input_size = input_size
         self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
     
     def forward(self, x):
-        """x: [0,1]の画像 → 2クラスロジット"""
-        # 分類器入力サイズにリサイズ
-        if x.shape[-1] != self.input_size or x.shape[-2] != self.input_size:
-            x = F.interpolate(x, size=(self.input_size, self.input_size), mode='bilinear', align_corners=False)
-        
         mean = self.mean.to(x.device)
         std = self.std.to(x.device)
         x_norm = (x - mean) / std
         return self.classifier(x_norm)
 
 
-# ========== Guided-Diffusion浄化クラス ==========
-class GuidedDiffusionPurifier(nn.Module):
-    """Guided-Diffusion (ImageNet Pretrained) による浄化
-    
-    入力: RGB画像 [0,1]
-    出力: 浄化後のRGB画像 [0,1]
-    """
-    def __init__(self, diffusion_model, diffusion, device, start_t=80, T_purify=50, eta=0.0):
-        super().__init__()
-        self.model = diffusion_model
-        self.diffusion = diffusion
-        self.device = device
-        self.start_t = start_t
-        self.T_purify = T_purify
-        self.eta = eta
-    
-    def pixel_to_diffusion(self, x_pixel):
-        """[0,1] → [-1,1]"""
-        return x_pixel * 2.0 - 1.0
-    
-    def diffusion_to_pixel(self, x_diff):
-        """[-1,1] → [0,1]"""
-        return torch.clamp((x_diff + 1.0) / 2.0, 0, 1)
-    
-    @torch.no_grad()
-    def purify(self, x_pixel):
-        """
-        RGB画像 [0,1] を浄化
-        
-        注意: 入力は224x224だが、Guided-Diffusionは256x256を期待
-        """
-        b = x_pixel.size(0)
-        original_size = x_pixel.shape[-2:]
-        
-        # 256x256にリサイズ（Guided-Diffusionの入力サイズ）
-        if original_size != (256, 256):
-            x_pixel = F.interpolate(x_pixel, size=(256, 256), mode='bilinear', align_corners=False)
-        
-        # [0,1] → [-1,1]
-        x_diff = self.pixel_to_diffusion(x_pixel)
-        
-        # Forward diffusion to start_t
-        t = torch.full((b,), self.start_t, device=self.device, dtype=torch.long)
-        noise = torch.randn_like(x_diff)
-        x_t = self.diffusion.q_sample(x_diff, t, noise=noise)
-        
-        # Reverse diffusion
-        end_t = max(self.start_t - self.T_purify, 0)
-        indices = list(range(self.start_t, end_t, -1))
-        
-        for i in indices:
-            t = torch.full((b,), i, device=self.device, dtype=torch.long)
-            
-            # モデル予測
-            out = self.diffusion.p_mean_variance(
-                self.model, x_t, t,
-                clip_denoised=True,
-                denoised_fn=None,
-                model_kwargs={}
-            )
-            
-            # DDIM step
-            if i > 0:
-                nonzero_mask = (t != 0).float().view(-1, 1, 1, 1)
-                x_t = out["mean"] + nonzero_mask * (self.eta * torch.sqrt(out["variance"])) * torch.randn_like(x_t)
-            else:
-                x_t = out["mean"]
-        
-        x_purified = torch.clamp(x_t, -1.0, 1.0)
-        
-        # [-1,1] → [0,1]
-        x_purified = self.diffusion_to_pixel(x_purified)
-        
-        # 元のサイズに戻す
-        if original_size != (256, 256):
-            x_purified = F.interpolate(x_purified, size=original_size, mode='bilinear', align_corners=False)
-        
-        return x_purified
-    
-    def forward(self, x_pixel):
-        return self.purify(x_pixel)
-
-
-class GuidedDiffusionDefenseWrapper(nn.Module):
-    """Guided-Diffusion浄化 + ViT分類器のラッパー"""
-    def __init__(self, purifier, classifier, mean, std, input_size=224):
+# ========== VAE Defense Wrapper ==========
+class VAEDefenseWrapper(nn.Module):
+    """VAE浄化 + ViT分類器のラッパー"""
+    def __init__(self, purifier, classifier, mean, std):
         super().__init__()
         self.purifier = purifier
         self.classifier = classifier
-        self.input_size = input_size
         self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
     
     def forward(self, x):
-        """x: [0,1]の画像 → 浄化 → 2クラスロジット"""
         x_purified = self.purifier(x)
-        
-        # 分類器入力サイズにリサイズ
-        if x_purified.shape[-1] != self.input_size or x_purified.shape[-2] != self.input_size:
-            x_purified = F.interpolate(x_purified, size=(self.input_size, self.input_size), mode='bilinear', align_corners=False)
-        
-        mean = self.mean.to(x_purified.device)
-        std = self.std.to(x_purified.device)
+        mean = self.mean.to(x.device)
+        std = self.std.to(x.device)
         x_norm = (x_purified - mean) / std
         return self.classifier(x_norm)
 
@@ -240,17 +293,17 @@ class GuidedDiffusionDefenseWrapper(nn.Module):
 # ========== PGD攻撃 ==========
 def pgd_attack(model, x, y, epsilon, alpha, steps, device, random_start=True):
     """
-    PGD攻撃 (L_inf)
+    PGD攻撃
     
     Args:
         model: 分類器（入力は[0,1]のRGB画像）
         x: 入力画像 [B, 3, H, W] in [0, 1]
         y: ラベル [B]
-        epsilon: 摂動の最大値（ピクセルスケール 0-1）
+        epsilon: 最大摂動量（ピクセルスケール 0-1）
         alpha: ステップサイズ（ピクセルスケール 0-1）
-        steps: 反復回数
+        steps: PGDステップ数
         device: デバイス
-        random_start: ランダム初期化
+        random_start: ランダム初期化を使用するか
     
     Returns:
         x_adv: 敵対的画像 [B, 3, H, W] in [0, 1]
@@ -258,32 +311,83 @@ def pgd_attack(model, x, y, epsilon, alpha, steps, device, random_start=True):
     x_orig = x.clone().detach().to(device)
     y = y.clone().detach().to(device)
     
-    # ランダム初期化
+    # ランダムスタート
     if random_start:
         x_adv = x_orig + torch.empty_like(x_orig).uniform_(-epsilon, epsilon)
         x_adv = torch.clamp(x_adv, 0.0, 1.0)
     else:
         x_adv = x_orig.clone()
     
-    # PGD反復
+    # PGDイテレーション
     for _ in range(steps):
         x_adv.requires_grad = True
         
+        # Forward pass
         outputs = model(x_adv)
         loss = F.cross_entropy(outputs, y)
         
+        # Backward pass
         model.zero_grad()
         loss.backward()
         grad = x_adv.grad.data
         
-        # ステップ更新
-        x_adv = x_adv + alpha * grad.sign()
+        # Update: x_adv = x_adv + alpha * sign(grad)
+        x_adv = x_adv.detach() + alpha * grad.sign()
         
-        # L_inf ボールへの射影
-        eta = torch.clamp(x_adv - x_orig, min=-epsilon, max=epsilon)
-        x_adv = torch.clamp(x_orig + eta, 0.0, 1.0).detach()
+        # Project back to epsilon ball
+        perturbation = torch.clamp(x_adv - x_orig, -epsilon, epsilon)
+        x_adv = torch.clamp(x_orig + perturbation, 0.0, 1.0).detach()
     
     return x_adv
+
+
+# ========== モデル読み込み ==========
+def load_models(args, device):
+    # ViT分類器
+    classifier = models.vit_b_16(weights=None)
+    in_features = classifier.heads.head.in_features
+    classifier.heads.head = nn.Sequential(
+        nn.Dropout(0.1),
+        nn.Linear(in_features, 2)
+    )
+    
+    checkpoint = torch.load(args.clf_ckpt, map_location=device)
+    if 'model_state_dict' in checkpoint:
+        classifier.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        classifier.load_state_dict(checkpoint)
+    classifier = classifier.to(device).eval()
+    print(f"Loaded ViT classifier from {args.clf_ckpt}")
+    
+    # VAE
+    vae_ckpt = torch.load(args.vae_ckpt, map_location=device)
+    if 'args' in vae_ckpt:
+        latent_dim = vae_ckpt['args'].get('latent_dim', args.latent_dim)
+        base_ch = vae_ckpt['args'].get('base_ch', args.base_ch)
+    else:
+        latent_dim = args.latent_dim
+        base_ch = args.base_ch
+    
+    print(f"VAE config: latent_dim={latent_dim}, base_ch={base_ch}")
+    
+    # PCam用VAEはRGB (img_channels=3)
+    vae = VAE(img_channels=3, base_ch=base_ch, latent_dim=latent_dim).to(device)
+    
+    # キー名の互換性対応
+    if 'vae_state_dict' in vae_ckpt:
+        vae.load_state_dict(vae_ckpt['vae_state_dict'])
+    elif 'ema_state_dict' in vae_ckpt and vae_ckpt['ema_state_dict'] is not None:
+        vae.load_state_dict(vae_ckpt['ema_state_dict'])
+        print("Using EMA weights")
+    elif 'model_state_dict' in vae_ckpt:
+        vae.load_state_dict(vae_ckpt['model_state_dict'])
+    else:
+        vae.load_state_dict(vae_ckpt)
+    
+    vae.eval()
+    print(f"Loaded VAE from {args.vae_ckpt}")
+    
+    return classifier, vae
 
 
 # ========== データ読み込み ==========
@@ -293,62 +397,12 @@ def load_cached_samples(cached_path):
     cached = torch.load(cached_path, map_location='cpu')
     x_test = cached['x_test']
     y_test = cached['y_test']
-    classes = cached.get('classes', ['NORMAL', 'PNEUMONIA'])
+    classes = cached.get('classes', ['normal', 'tumor'])
     print(f"Loaded {len(x_test)} correctly classified samples")
     print(f"  x_test shape: {x_test.shape}")
     print(f"  y_test shape: {y_test.shape}")
     print(f"  Classes: {classes}")
     return x_test, y_test, classes
-
-
-# ========== モデル読み込み ==========
-def load_models(args, device):
-    """ViT分類器とGuided-Diffusionを読み込み"""
-    # ViT分類器（2クラス: NORMAL, PNEUMONIA）
-    classifier = models.vit_b_16(weights=None)
-    in_features = classifier.heads.head.in_features
-    classifier.heads.head = nn.Sequential(
-        nn.Dropout(0.1),
-        nn.Linear(in_features, 2)
-    )
-    
-    ckpt = torch.load(args.clf_ckpt, map_location=device)
-    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-        classifier.load_state_dict(ckpt['model_state_dict'])
-    else:
-        classifier.load_state_dict(ckpt)
-    classifier = classifier.to(device).eval()
-    print(f"Loaded ViT classifier from {args.clf_ckpt}")
-    
-    # Guided-Diffusion (ImageNet 256x256 unconditional)
-    print(f"\nLoading Guided-Diffusion from: {args.diffusion_ckpt}")
-    
-    model_config = model_and_diffusion_defaults()
-    model_config.update({
-        'attention_resolutions': '32,16,8',
-        'class_cond': False,
-        'diffusion_steps': 1000,
-        'rescale_timesteps': True,
-        'timestep_respacing': '1000',
-        'image_size': 256,
-        'learn_sigma': True,
-        'noise_schedule': 'linear',
-        'num_channels': 256,
-        'num_head_channels': 64,
-        'num_res_blocks': 2,
-        'resblock_updown': True,
-        'use_fp16': False,
-        'use_scale_shift_norm': True,
-    })
-    
-    diffusion_model, diffusion = create_model_and_diffusion(**model_config)
-    diffusion_model.load_state_dict(
-        torch.load(args.diffusion_ckpt, map_location="cpu")
-    )
-    diffusion_model = diffusion_model.to(device).eval()
-    print("Loaded Guided-Diffusion model")
-    
-    return classifier, diffusion_model, diffusion
 
 
 # ========== 精度計算 ==========
@@ -417,7 +471,7 @@ def print_confusion_matrix(y_true, y_pred, title, classes=None):
 
 
 # ========== PGD攻撃実行 ==========
-def run_pgd_attack(model, x_test, y_test, epsilon, alpha, steps, device, batch_size=32, random_start=True):
+def run_pgd_attack(model, x_test, y_test, epsilon, alpha, steps, device, batch_size, random_start=True):
     """PGD攻撃を実行して敵対的サンプルを生成"""
     print(f"\nRunning PGD attack with epsilon={epsilon:.4f}, alpha={alpha:.4f}, steps={steps}...")
     
@@ -450,7 +504,7 @@ def save_sample_images(x_clean, x_adv, x_purified_clean, x_purified_adv,
         label = int(y_true[i])
         label_name = classes[label] if classes else str(label)
         
-        # 4枚を並べて保存: Clean, Clean+Purified, Adv, Adv+Purified
+        # 4枚を並べて保存: Clean, Clean+VAE, Adv, Adv+VAE
         quad = torch.cat([
             x_clean[i:i+1],
             x_purified_clean[i:i+1],
@@ -461,7 +515,7 @@ def save_sample_images(x_clean, x_adv, x_purified_clean, x_purified_adv,
         save_image(grid, os.path.join(save_dir, f"{i:04d}_{label_name}.png"))
     
     print(f"Saved {n} sample images to {save_dir}")
-    print(f"  Format: [Clean | Clean+Purified | Adversarial | Adv+Purified]")
+    print(f"  Format: [Clean | Clean+VAE | Adversarial | Adv+VAE]")
 
 
 # ========== メイン ==========
@@ -485,19 +539,14 @@ def main():
     print(f"Output directory: {log_dir}")
     
     # モデル読み込み
-    classifier, diffusion_model, diffusion = load_models(args, device)
+    classifier, vae = load_models(args, device)
     
     # 浄化器
-    purifier = GuidedDiffusionPurifier(
-        diffusion_model, diffusion, device,
-        start_t=args.start_t,
-        T_purify=args.T_purify,
-        eta=args.eta
-    )
+    purifier = VAEPurifier(vae, device).to(device)
     
     # ラッパー作成
     classifier_model = ViTClassifierWrapper(classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
-    defense_model = GuidedDiffusionDefenseWrapper(purifier, classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
+    defense_model = VAEDefenseWrapper(purifier, classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
     
     # データ読み込み
     x_test, y_test, classes = load_cached_samples(args.cached_samples)
@@ -505,12 +554,14 @@ def main():
     
     # ==================== 評価開始 ====================
     print(f"\n{'='*70}")
-    print("PGD Attack + Guided-Diffusion Defense Evaluation (ViT Classifier)")
+    print("PGD Attack + VAE Defense Evaluation (ViT Classifier)")
     print(f"{'='*70}")
+    print(f"Dataset: PCam")
     print(f"Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
     print(f"Alpha: {args.alpha:.4f} ({args.alpha*255:.1f}/255)")
-    print(f"PGD Steps: {args.pgd_steps}")
-    print(f"Diffusion: start_t={args.start_t}, T_purify={args.T_purify}")
+    print(f"Steps: {args.pgd_steps}")
+    print(f"Random start: {args.random_start}")
+    print(f"VAE: latent_dim={args.latent_dim}, base_ch={args.base_ch}, RGB input")
     print(f"Samples: {len(x_test)}")
     print(f"{'='*70}")
     
@@ -523,10 +574,10 @@ def main():
     results['clean_acc_classifier'] = clean_acc
     
     # ========== 2. クリーン画像を浄化した後の精度 ==========
-    print("\n[2/4] Evaluating clean images with Guided-Diffusion purification...")
+    print("\n[2/4] Evaluating clean images with VAE purification...")
     clean_purified_acc = get_accuracy(defense_model, x_test, y_test, bs=args.batch_size, device=device)
-    print(f"Clean accuracy (with Guided-Diffusion): {clean_purified_acc:.4f}")
-    results['clean_acc_with_diffusion'] = clean_purified_acc
+    print(f"Clean accuracy (with VAE): {clean_purified_acc:.4f}")
+    results['clean_acc_with_vae'] = clean_purified_acc
     
     # ========== 3. PGD攻撃 & 敵対的画像の精度（防御なし） ==========
     print("\n[3/4] Running PGD attack and evaluating adversarial images...")
@@ -541,10 +592,10 @@ def main():
     results['attack_time'] = attack_time
     
     # ========== 4. 敵対的画像を浄化した後の精度（防御あり） ==========
-    print("\n[4/4] Evaluating adversarial images with Guided-Diffusion purification...")
+    print("\n[4/4] Evaluating adversarial images with VAE purification...")
     adv_defended_acc = get_accuracy(defense_model, x_adv, y_test, bs=args.batch_size, device=device)
-    print(f"Adversarial accuracy (with Guided-Diffusion): {adv_defended_acc:.4f}")
-    results['adv_acc_with_diffusion'] = adv_defended_acc
+    print(f"Adversarial accuracy (with VAE): {adv_defended_acc:.4f}")
+    results['adv_acc_with_vae'] = adv_defended_acc
     
     # 防御効果
     defense_improvement = adv_defended_acc - adv_acc_no_defense
@@ -554,19 +605,20 @@ def main():
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
+    print(f"Dataset: PCam")
     print(f"Classifier: ViT-B/16")
     print(f"Attack: PGD, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
     print(f"        Alpha: {args.alpha:.4f} ({args.alpha*255:.1f}/255), Steps: {args.pgd_steps}")
-    print(f"Diffusion: ImageNet Pretrained, start_t={args.start_t}, T_purify={args.T_purify}")
+    print(f"VAE: latent_dim={args.latent_dim}, base_ch={args.base_ch}, RGB input")
     print(f"-"*70)
     print(f"Clean Accuracy:")
-    print(f"  ViT classifier only:           {results['clean_acc_classifier']:.4f}")
-    print(f"  With Guided-Diffusion:         {results['clean_acc_with_diffusion']:.4f}")
+    print(f"  ViT classifier only:      {results['clean_acc_classifier']:.4f}")
+    print(f"  With VAE purification:    {results['clean_acc_with_vae']:.4f}")
     print(f"-"*70)
     print(f"Adversarial Accuracy (PGD):")
-    print(f"  Without defense:               {results['adv_acc_no_defense']:.4f}")
-    print(f"  With Guided-Diffusion:         {results['adv_acc_with_diffusion']:.4f}")
-    print(f"  Defense improvement:           {results['defense_improvement']:+.4f}")
+    print(f"  Without defense:          {results['adv_acc_no_defense']:.4f}")
+    print(f"  With VAE purification:    {results['adv_acc_with_vae']:.4f}")
+    print(f"  Defense improvement:      {results['defense_improvement']:+.4f}")
     print(f"-"*70)
     print(f"Attack time: {results['attack_time']:.2f}s")
     print(f"{'='*70}")
@@ -585,9 +637,9 @@ def main():
     y_true = y_test.cpu().numpy()
     
     cm_clean = print_confusion_matrix(y_true, pred_clean, "1. Clean Images (ViT classifier only)", classes)
-    cm_clean_purified = print_confusion_matrix(y_true, pred_clean_purified, "2. Clean Images (with Guided-Diffusion)", classes)
+    cm_clean_purified = print_confusion_matrix(y_true, pred_clean_purified, "2. Clean Images (with VAE)", classes)
     cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "3. Adversarial Images (No Defense)", classes)
-    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "4. Adversarial Images (with Guided-Diffusion)", classes)
+    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "4. Adversarial Images (with VAE)", classes)
     
     results['confusion_matrices'] = {
         'clean': cm_clean,
@@ -635,15 +687,16 @@ def main():
     summary_path = os.path.join(log_dir, 'summary.txt')
     with open(summary_path, 'w') as f:
         f.write("="*70 + "\n")
-        f.write("ChestX-ray - PGD Attack + Guided-Diffusion Defense (ViT Classifier)\n")
+        f.write("PCam - PGD Attack + VAE Defense (ViT Classifier)\n")
         f.write("="*70 + "\n\n")
+        f.write(f"Dataset: PCam\n")
         f.write(f"Classifier: ViT-B/16\n")
         f.write(f"Attack: PGD\n")
         f.write(f"Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)\n")
         f.write(f"Alpha: {args.alpha:.4f} ({args.alpha*255:.1f}/255)\n")
-        f.write(f"PGD Steps: {args.pgd_steps}\n")
-        f.write(f"Random Start: {args.random_start}\n")
-        f.write(f"Diffusion: ImageNet Pretrained, start_t={args.start_t}, T_purify={args.T_purify}\n")
+        f.write(f"Steps: {args.pgd_steps}\n")
+        f.write(f"Random start: {args.random_start}\n")
+        f.write(f"VAE: latent_dim={args.latent_dim}, base_ch={args.base_ch}, RGB input\n")
         f.write(f"Samples: {len(x_test)}\n\n")
         
         f.write("-"*70 + "\n")
@@ -651,13 +704,13 @@ def main():
         f.write("-"*70 + "\n\n")
         
         f.write("Clean Accuracy:\n")
-        f.write(f"  ViT classifier only:           {results['clean_acc_classifier']:.4f}\n")
-        f.write(f"  With Guided-Diffusion:         {results['clean_acc_with_diffusion']:.4f}\n\n")
+        f.write(f"  ViT classifier only:      {results['clean_acc_classifier']:.4f}\n")
+        f.write(f"  With VAE purification:    {results['clean_acc_with_vae']:.4f}\n\n")
         
         f.write("Adversarial Accuracy (PGD):\n")
-        f.write(f"  Without defense:               {results['adv_acc_no_defense']:.4f}\n")
-        f.write(f"  With Guided-Diffusion:         {results['adv_acc_with_diffusion']:.4f}\n")
-        f.write(f"  Defense improvement:           {results['defense_improvement']:+.4f}\n\n")
+        f.write(f"  Without defense:          {results['adv_acc_no_defense']:.4f}\n")
+        f.write(f"  With VAE purification:    {results['adv_acc_with_vae']:.4f}\n")
+        f.write(f"  Defense improvement:      {results['defense_improvement']:+.4f}\n\n")
         
         f.write(f"Attack time: {results['attack_time']:.2f}s\n\n")
         
@@ -666,9 +719,9 @@ def main():
         f.write("-"*70 + "\n\n")
         
         for name, cm in [("Clean (ViT Classifier)", cm_clean), 
-                         ("Clean (with Guided-Diffusion)", cm_clean_purified),
+                         ("Clean (with VAE)", cm_clean_purified),
                          ("Adversarial (No Defense)", cm_adv_no_def),
-                         ("Adversarial (with Guided-Diffusion)", cm_adv_defended)]:
+                         ("Adversarial (with VAE)", cm_adv_defended)]:
             if cm:
                 f.write(f"{name}:\n")
                 f.write(f"  TN: {cm['tn']:4d}  FP: {cm['fp']:4d}\n")
@@ -678,12 +731,14 @@ def main():
     
     # JSON形式でも保存
     results_json = {
+        'dataset': 'PCam',
         'classifier': 'ViT-B/16',
+        'defense': 'VAE',
         'args': vars(args),
         'clean_acc_classifier': results['clean_acc_classifier'],
-        'clean_acc_with_diffusion': results['clean_acc_with_diffusion'],
+        'clean_acc_with_vae': results['clean_acc_with_vae'],
         'adv_acc_no_defense': results['adv_acc_no_defense'],
-        'adv_acc_with_diffusion': results['adv_acc_with_diffusion'],
+        'adv_acc_with_vae': results['adv_acc_with_vae'],
         'defense_improvement': results['defense_improvement'],
         'attack_time': results['attack_time'],
     }

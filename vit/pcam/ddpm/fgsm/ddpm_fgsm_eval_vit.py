@@ -25,7 +25,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 # プロジェクトのルートを追加
-sys.path.insert(0, '/mnt/data1/gotou/projects/pcam/ddpm')
+sys.path.insert(0, '/mnt/data1/gotou/projects/resnet/pcam/ddpm')
 from ddpm_train_pcam import SimpleUNet, GaussianDiffusion
 
 
@@ -38,25 +38,25 @@ def parse_args():
                         help='FGSM perturbation epsilon')
     
     # DDPM浄化設定
-    parser.add_argument('--t_purify', type=int, default=50,
+    parser.add_argument('--t_purify', type=int, default=300,
                         help='Number of diffusion steps for purification')
-    parser.add_argument('--start_t', type=int, default=80,
+    parser.add_argument('--start_t', type=int, default=280,
                         help='Starting timestep for reverse diffusion')
-    parser.add_argument('--eta', type=float, default=0.0,
+    parser.add_argument('--eta', type=float, default=1.0,
                         help='Stochasticity parameter for DDIM')
     
     # パス設定
     parser.add_argument('--cached_samples', type=str,
-                        default='/mnt/data1/gotou/projects/pcam/vit/correct_samples_balanced_500_vit.pt',
+                        default='/mnt/data1/gotou/projects/vit/pcam/correct_samples_balanced_500_vit.pt',
                         help='Path to cached correct samples')
     parser.add_argument('--ddpm_ckpt', type=str,
-                        default='/mnt/data1/gotou/projects/pcam/ddpm/checkpoints/best_model.pth',
+                        default='/mnt/data1/gotou/projects/resnet/pcam/ddpm/checkpoints/best_model.pth',
                         help='DDPM checkpoint path')
     parser.add_argument('--clf_ckpt', type=str,
-                        default='/mnt/data1/gotou/projects/classifiers/vit/checkpoints/pcam/20260117_210505/best_vit_pcam.pth',
+                        default='/mnt/data1/gotou/projects/vit/classifiers/checkpoints/pcam/20260117_210505/best_vit_pcam.pth',
                         help='ViT classifier checkpoint path')
     parser.add_argument('--output_dir', type=str,
-                        default='/mnt/data1/gotou/projects/pcam/vit/fgsm/results',
+                        default='/mnt/data1/gotou/projects/vit/pcam/ddpm/fgsm/results',
                         help='Output directory')
     
     # 実行設定

@@ -76,7 +76,7 @@ def parse_args():
                         help='Output directory')
     
     # GPU設定
-    parser.add_argument('--gpu', type=int, default=2,
+    parser.add_argument('--gpu', type=int, default=0,
                         help='GPU ID to use')
     
     return parser.parse_args()
