@@ -571,7 +571,7 @@ def run_pgd_attack(model, x_test, y_test, epsilon, alpha, steps, device, batch_s
 
 
 # ========== サンプル画像保存 ==========
-def save_sample_images(x_clean, x_adv, x_purified_clean, x_purified_adv, 
+def save_sample_images(x_clean, x_adv, x_purified_adv, 
                        y_true, classes, save_dir, max_samples=10):
     """サンプル画像を保存"""
     os.makedirs(save_dir, exist_ok=True)
@@ -581,18 +581,17 @@ def save_sample_images(x_clean, x_adv, x_purified_clean, x_purified_adv,
         label = int(y_true[i])
         label_name = classes[label] if classes else str(label)
         
-        # 4枚を並べて保存: Clean, Clean+GAN, Adv, Adv+GAN
-        quad = torch.cat([
+        # 3枚を並べて保存: Clean, Adv, Adv+GAN
+        triplet = torch.cat([
             x_clean[i:i+1],
-            x_purified_clean[i:i+1],
             x_adv[i:i+1],
             x_purified_adv[i:i+1]
         ], dim=0)
-        grid = make_grid(quad, nrow=4, padding=5, pad_value=1.0)
+        grid = make_grid(triplet, nrow=3, padding=5, pad_value=1.0)
         save_image(grid, os.path.join(save_dir, f"{i:04d}_{label_name}.png"))
     
     print(f"Saved {n} sample images to {save_dir}")
-    print(f"  Format: [Clean | Clean+GAN | Adversarial | Adv+GAN]")
+    print(f"  Format: [Clean | Adversarial | Adv+GAN]")
 
 
 # ========== メイン ==========
@@ -632,7 +631,7 @@ def main():
     
     # 推定実行時間を表示
     estimated_time_per_sample = args.rec_iters * args.rec_rr * 0.008  # 約8ms/iteration
-    estimated_total = estimated_time_per_sample * 500 * 4  # 4回の浄化処理
+    estimated_total = estimated_time_per_sample * 500  # 1回の浄化処理（敵対的画像のみ）
     print(f"Estimated time: ~{estimated_total/60:.1f} minutes (with early stopping, likely faster)")
     
     # ラッパー作成
@@ -656,20 +655,13 @@ def main():
     results = {}
     
     # ========== 1. クリーン画像の精度 ==========
-    print("\n[1/4] Evaluating clean images (ViT classifier only)...")
+    print("\n[1/3] Evaluating clean images (ViT classifier only)...")
     clean_acc = get_accuracy(classifier_model, x_test, y_test, bs=args.batch_size, device=device)
     print(f"Clean accuracy (ViT classifier): {clean_acc:.4f}")
     results['clean_acc_classifier'] = clean_acc
     
-    # ========== 2. クリーン画像を浄化した後の精度 ==========
-    print("\n[2/4] Evaluating clean images with Defense-GAN purification...")
-    clean_purified_acc, pred_clean_purified = get_accuracy_and_predictions_with_defense(
-        classifier_model, x_test, y_test, defense_gan, bs=4, device=device)
-    print(f"Clean accuracy (with Defense-GAN): {clean_purified_acc:.4f}")
-    results['clean_acc_with_gan'] = clean_purified_acc
-    
-    # ========== 3. PGD攻撃 & 敵対的画像の精度（防御なし） ==========
-    print("\n[3/4] Running PGD attack and evaluating adversarial images...")
+    # ========== 2. PGD攻撃 & 敵対的画像の精度（防御なし） ==========
+    print("\n[2/3] Running PGD attack and evaluating adversarial images...")
     start_time = time.time()
     x_adv = run_pgd_attack(classifier_model, x_test, y_test, args.epsilon, args.alpha, 
                            args.pgd_steps, device, args.batch_size, args.random_start)
@@ -680,8 +672,8 @@ def main():
     results['adv_acc_no_defense'] = adv_acc_no_defense
     results['attack_time'] = attack_time
     
-    # ========== 4. 敵対的画像を浄化した後の精度（防御あり） ==========
-    print("\n[4/4] Evaluating adversarial images with Defense-GAN purification...")
+    # ========== 3. 敵対的画像を浄化した後の精度（防御あり） ==========
+    print("\n[3/3] Evaluating adversarial images with Defense-GAN purification...")
     adv_defended_acc, pred_adv_defended = get_accuracy_and_predictions_with_defense(
         classifier_model, x_adv, y_test, defense_gan, bs=4, device=device)
     print(f"Adversarial accuracy (with Defense-GAN): {adv_defended_acc:.4f}")
@@ -701,9 +693,7 @@ def main():
     print(f"Defense-GAN: rec_iters={args.rec_iters}, rec_lr={args.rec_lr}, rec_rr={args.rec_rr}")
     print(f"Note: Generator is trained on RGB images")
     print(f"-"*70)
-    print(f"Clean Accuracy:")
-    print(f"  ViT classifier only:       {results['clean_acc_classifier']:.4f}")
-    print(f"  With Defense-GAN:          {results['clean_acc_with_gan']:.4f}")
+    print(f"Clean Accuracy (ViT classifier): {results['clean_acc_classifier']:.4f}")
     print(f"-"*70)
     print(f"Adversarial Accuracy (PGD):")
     print(f"  Without defense:           {results['adv_acc_no_defense']:.4f}")
@@ -721,18 +711,16 @@ def main():
     # 予測取得（Defense-GAN処理済みの予測は既に取得済み）
     pred_clean = get_predictions(classifier_model, x_test, bs=args.batch_size, device=device)
     pred_adv_no_def = get_predictions(classifier_model, x_adv, bs=args.batch_size, device=device)
-    # pred_clean_purified と pred_adv_defended は上で既に取得済み
+    # pred_adv_defended は上で既に取得済み
     
     y_true = y_test.cpu().numpy()
     
     cm_clean = print_confusion_matrix(y_true, pred_clean, "1. Clean Images (ViT classifier only)", classes)
-    cm_clean_purified = print_confusion_matrix(y_true, pred_clean_purified, "2. Clean Images (with Defense-GAN)", classes)
-    cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "3. Adversarial Images (No Defense)", classes)
-    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "4. Adversarial Images (with Defense-GAN)", classes)
+    cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "2. Adversarial Images (No Defense)", classes)
+    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "3. Adversarial Images (with Defense-GAN)", classes)
     
     results['confusion_matrices'] = {
         'clean': cm_clean,
-        'clean_purified': cm_clean_purified,
         'adv_no_defense': cm_adv_no_def,
         'adv_defended': cm_adv_defended
     }
@@ -740,20 +728,16 @@ def main():
     # ==================== 浄化画像を生成して保存 ====================
     print("\nGenerating purified samples for visualization...")
     n_samples = min(10, len(x_test))
-    x_purified_clean = []
     x_purified_adv = []
     
     for i in range(n_samples):
-        x_purified_clean.append(defense_gan.reconstruct(x_test[i:i+1].to(device)).cpu())
         x_purified_adv.append(defense_gan.reconstruct(x_adv[i:i+1].to(device)).cpu())
     
-    x_purified_clean = torch.cat(x_purified_clean, dim=0)
     x_purified_adv = torch.cat(x_purified_adv, dim=0)
     
     save_sample_images(
         x_test[:n_samples].cpu(), 
         x_adv[:n_samples].cpu(),
-        x_purified_clean,
         x_purified_adv,
         y_test[:n_samples].cpu().numpy(), 
         classes,
@@ -791,9 +775,7 @@ def main():
         f.write("RESULTS\n")
         f.write("-"*70 + "\n\n")
         
-        f.write("Clean Accuracy:\n")
-        f.write(f"  ViT classifier only:       {results['clean_acc_classifier']:.4f}\n")
-        f.write(f"  With Defense-GAN:          {results['clean_acc_with_gan']:.4f}\n\n")
+        f.write(f"Clean Accuracy (ViT classifier): {results['clean_acc_classifier']:.4f}\n\n")
         
         f.write("Adversarial Accuracy (PGD):\n")
         f.write(f"  Without defense:           {results['adv_acc_no_defense']:.4f}\n")
@@ -807,7 +789,6 @@ def main():
         f.write("-"*70 + "\n\n")
         
         for name, cm in [("Clean (ViT Classifier)", cm_clean), 
-                         ("Clean (with Defense-GAN)", cm_clean_purified),
                          ("Adversarial (No Defense)", cm_adv_no_def),
                          ("Adversarial (with Defense-GAN)", cm_adv_defended)]:
             if cm:
@@ -823,7 +804,6 @@ def main():
         'classifier': 'ViT-B/16',
         'args': vars(args),
         'clean_acc_classifier': results['clean_acc_classifier'],
-        'clean_acc_with_gan': results['clean_acc_with_gan'],
         'adv_acc_no_defense': results['adv_acc_no_defense'],
         'adv_acc_with_gan': results['adv_acc_with_gan'],
         'defense_improvement': results['defense_improvement'],

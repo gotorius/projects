@@ -351,17 +351,18 @@ def load_models(args, device):
     return classifier, diffusion_model, diffusion
 
 
-# ========== 精度計算 ==========
-def get_accuracy(model, x, y, bs=32, device=None):
-    """モデルの精度を計算"""
+# ========== 精度計算と予測取得を統一 ==========
+def get_predictions_and_accuracy(model, x, y, bs=32, device=None, desc="Evaluating"):
+    """モデルの予測と精度を同時に取得（重複計算を避ける）"""
     if device is None:
         device = next(model.parameters()).device
     
     n_batches = (len(x) + bs - 1) // bs
     correct = 0
+    all_preds = []
     
     with torch.no_grad():
-        for i in range(n_batches):
+        for i in tqdm(range(n_batches), desc=desc, leave=False):
             start_idx = i * bs
             end_idx = min((i + 1) * bs, len(x))
             x_batch = x[start_idx:end_idx].to(device)
@@ -369,28 +370,49 @@ def get_accuracy(model, x, y, bs=32, device=None):
             outputs = model(x_batch)
             preds = outputs.argmax(dim=1)
             correct += (preds == y_batch).sum().item()
+            all_preds.append(preds.cpu())
     
-    return correct / len(x)
+    accuracy = correct / len(x)
+    predictions = torch.cat(all_preds).numpy()
+    return accuracy, predictions
 
 
-# ========== 予測取得 ==========
-def get_predictions(model, x, bs=32, device=None):
-    """モデルの予測を取得"""
+def get_predictions_and_accuracy_with_purification(classifier_model, defense_model, x, y, bs=32, device=None, desc="Evaluating"):
+    """分類器と防御モデル両方の予測と精度を同時に取得"""
     if device is None:
-        device = next(model.parameters()).device
+        device = next(classifier_model.parameters()).device
     
     n_batches = (len(x) + bs - 1) // bs
-    preds = []
+    correct_clf = 0
+    correct_def = 0
+    all_preds_clf = []
+    all_preds_def = []
     
     with torch.no_grad():
-        for i in range(n_batches):
+        for i in tqdm(range(n_batches), desc=desc, leave=False):
             start_idx = i * bs
             end_idx = min((i + 1) * bs, len(x))
             x_batch = x[start_idx:end_idx].to(device)
-            outputs = model(x_batch)
-            preds.append(outputs.argmax(dim=1).cpu())
+            y_batch = y[start_idx:end_idx].to(device)
+            
+            # 分類器のみ
+            outputs_clf = classifier_model(x_batch)
+            preds_clf = outputs_clf.argmax(dim=1)
+            correct_clf += (preds_clf == y_batch).sum().item()
+            all_preds_clf.append(preds_clf.cpu())
+            
+            # 防御モデル（浄化＋分類）
+            outputs_def = defense_model(x_batch)
+            preds_def = outputs_def.argmax(dim=1)
+            correct_def += (preds_def == y_batch).sum().item()
+            all_preds_def.append(preds_def.cpu())
     
-    return torch.cat(preds).numpy()
+    accuracy_clf = correct_clf / len(x)
+    accuracy_def = correct_def / len(x)
+    predictions_clf = torch.cat(all_preds_clf).numpy()
+    predictions_def = torch.cat(all_preds_def).numpy()
+    
+    return accuracy_clf, predictions_clf, accuracy_def, predictions_def
 
 
 # ========== 混同行列出力 ==========
@@ -516,16 +538,15 @@ def main():
     
     results = {}
     
-    # ========== 1. クリーン画像の精度 ==========
-    print("\n[1/4] Evaluating clean images (ViT classifier only)...")
-    clean_acc = get_accuracy(classifier_model, x_test, y_test, bs=args.batch_size, device=device)
+    # ========== 1&2. クリーン画像の精度（分類器のみ & 浄化あり）を同時に計算 ==========
+    print("\n[1&2/4] Evaluating clean images (classifier only and with Guided-Diffusion)...")
+    clean_acc, pred_clean, clean_purified_acc, pred_clean_purified = get_predictions_and_accuracy_with_purification(
+        classifier_model, defense_model, x_test, y_test, bs=args.batch_size, device=device,
+        desc="Clean images"
+    )
     print(f"Clean accuracy (ViT classifier): {clean_acc:.4f}")
-    results['clean_acc_classifier'] = clean_acc
-    
-    # ========== 2. クリーン画像を浄化した後の精度 ==========
-    print("\n[2/4] Evaluating clean images with Guided-Diffusion purification...")
-    clean_purified_acc = get_accuracy(defense_model, x_test, y_test, bs=args.batch_size, device=device)
     print(f"Clean accuracy (with Guided-Diffusion): {clean_purified_acc:.4f}")
+    results['clean_acc_classifier'] = clean_acc
     results['clean_acc_with_diffusion'] = clean_purified_acc
     
     # ========== 3. PGD攻撃 & 敵対的画像の精度（防御なし） ==========
@@ -534,16 +555,17 @@ def main():
     x_adv = run_pgd_attack(classifier_model, x_test, y_test, args.epsilon, args.alpha, 
                            args.pgd_steps, device, args.batch_size, args.random_start)
     attack_time = time.time() - start_time
-    
-    adv_acc_no_defense = get_accuracy(classifier_model, x_adv, y_test, bs=args.batch_size, device=device)
-    print(f"Adversarial accuracy (no defense): {adv_acc_no_defense:.4f}")
-    results['adv_acc_no_defense'] = adv_acc_no_defense
     results['attack_time'] = attack_time
     
-    # ========== 4. 敵対的画像を浄化した後の精度（防御あり） ==========
-    print("\n[4/4] Evaluating adversarial images with Guided-Diffusion purification...")
-    adv_defended_acc = get_accuracy(defense_model, x_adv, y_test, bs=args.batch_size, device=device)
+    # ========== 3&4. 敵対的画像の精度（防御なし & 防御あり）を同時に計算 ==========
+    print("\n[4/4] Evaluating adversarial images (no defense and with Guided-Diffusion)...")
+    adv_acc_no_defense, pred_adv_no_def, adv_defended_acc, pred_adv_defended = get_predictions_and_accuracy_with_purification(
+        classifier_model, defense_model, x_adv, y_test, bs=args.batch_size, device=device,
+        desc="Adversarial images"
+    )
+    print(f"Adversarial accuracy (no defense): {adv_acc_no_defense:.4f}")
     print(f"Adversarial accuracy (with Guided-Diffusion): {adv_defended_acc:.4f}")
+    results['adv_acc_no_defense'] = adv_acc_no_defense
     results['adv_acc_with_diffusion'] = adv_defended_acc
     
     # 防御効果
@@ -576,12 +598,7 @@ def main():
     print("Confusion Matrices")
     print(f"{'='*70}")
     
-    # 予測取得
-    pred_clean = get_predictions(classifier_model, x_test, bs=args.batch_size, device=device)
-    pred_clean_purified = get_predictions(defense_model, x_test, bs=args.batch_size, device=device)
-    pred_adv_no_def = get_predictions(classifier_model, x_adv, bs=args.batch_size, device=device)
-    pred_adv_defended = get_predictions(defense_model, x_adv, bs=args.batch_size, device=device)
-    
+    # 注: 予測は既に上で計算済み（重複計算を避けるため）
     y_true = y_test.cpu().numpy()
     
     cm_clean = print_confusion_matrix(y_true, pred_clean, "1. Clean Images (ViT classifier only)", classes)
@@ -603,7 +620,7 @@ def main():
     x_purified_adv = []
     
     with torch.no_grad():
-        for i in range(n_samples):
+        for i in tqdm(range(n_samples), desc="Generating purified samples", leave=False):
             x_purified_clean.append(purifier(x_test[i:i+1].to(device)).cpu())
             x_purified_adv.append(purifier(x_adv[i:i+1].to(device)).cpu())
     
