@@ -66,12 +66,12 @@ def parse_args():
                         help='Use random start for PGD')
     
     # 拡散モデル浄化設定
-    parser.add_argument('--start_t', type=int, default=280,
+    parser.add_argument('--start_t', type=int, default=80,
                         help='Diffusion start timestep')
-    parser.add_argument('--T_purify', type=int, default=300,
+    parser.add_argument('--T_purify', type=int, default=50,
                         help='Number of purification steps')
-    parser.add_argument('--eta', type=float, default=0.0,
-                        help='DDIM sampling eta (0=deterministic)')
+    parser.add_argument('--eta', type=float, default=1.0,
+                        help='Sampling eta (0=DDIM deterministic, 1=DDPM stochastic)')
     
     # 実行設定
     parser.add_argument('--batch_size', type=int, default=8,

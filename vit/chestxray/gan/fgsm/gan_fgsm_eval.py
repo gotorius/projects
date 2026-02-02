@@ -15,7 +15,7 @@ ChestX-ray特有の考慮:
 
 実行例:
 python gan_fgsm_eval.py --epsilon 0.031 --use_defense
-python gan_fgsm_eval.py --epsilon 0.031 --rec_iters 500 --rec_lr 0.01
+python gan_fgsm_eval.py --epsilon 0.031 --rec_iters 150 --rec_lr 0.01
 """
 
 import os
@@ -50,13 +50,11 @@ def parse_args():
     parser.add_argument('--use_defense', action='store_true', default=True,
                         help='Enable Defense-GAN purification')
     parser.add_argument('--rec_iters', type=int, default=150,
-                        help='Number of reconstruction iterations (reduced from 500 for speed)')
+                        help='Number of reconstruction iterations')
     parser.add_argument('--rec_lr', type=float, default=0.01,
                         help='Learning rate for reconstruction')
     parser.add_argument('--rec_rr', type=int, default=3,
-                        help='Number of random restarts (reduced from 10 for speed)')
-    parser.add_argument('--early_stop_threshold', type=float, default=0.01,
-                        help='Early stopping threshold for reconstruction loss')
+                        help='Number of random restarts')
     
     # パス設定
     parser.add_argument('--gan_ckpt', type=str,
@@ -214,20 +212,15 @@ class DefenseGAN:
     - Generator出力は1チャンネル（グレースケール）
     - 分類器入力は3チャンネル（RGB複製）
     - 最適化はグレースケール空間で行う
-    
-    最適化済み:
-    - 早期停止による高速化
-    - パラメータ削減による実用的な実行時間
     """
-    def __init__(self, generator, latent_dim=512, rec_iters=150, rec_lr=0.01, 
-                 rec_rr=3, early_stop_threshold=0.01, device='cuda'):
+    def __init__(self, generator, latent_dim=512, rec_iters=500, rec_lr=0.01, 
+                 rec_rr=10, device='cuda'):
         self.generator = generator
         self.generator.eval()
         self.latent_dim = latent_dim
         self.rec_iters = rec_iters
         self.rec_lr = rec_lr
         self.rec_rr = rec_rr
-        self.early_stop_threshold = early_stop_threshold
         self.device = device
     
     def _rgb_to_gray(self, x):
@@ -256,8 +249,6 @@ class DefenseGAN:
         入力画像xを生成器で再構成 (バッチ単位)
         x: (B, 3, H, W), [0,1]範囲
         return: 再構成画像 (B, 3, H, W), [0,1]範囲
-        
-        最適化: 早期停止条件により収束したら即座に終了
         """
         batch_size = x.size(0)
         
@@ -273,7 +264,7 @@ class DefenseGAN:
             z = torch.randn(batch_size, self.latent_dim, device=self.device, requires_grad=True)
             optimizer = torch.optim.Adam([z], lr=self.rec_lr, betas=(0.9, 0.999))
             
-            for iter_idx in range(self.rec_iters):
+            for _ in range(self.rec_iters):
                 optimizer.zero_grad()
                 
                 x_gen = self.generator(z)  # [B, 1, H, W] in [-1, 1]
@@ -283,10 +274,6 @@ class DefenseGAN:
                 total_loss = loss.sum()
                 total_loss.backward()
                 optimizer.step()
-                
-                # 早期停止: 全サンプルが閾値以下なら終了
-                if loss.max().item() < self.early_stop_threshold:
-                    break
             
             # Update best z for each sample
             with torch.no_grad():
@@ -298,10 +285,6 @@ class DefenseGAN:
                     if final_loss[i].item() < best_loss_list[i]:
                         best_loss_list[i] = final_loss[i].item()
                         best_z_list[i] = z[i].clone()
-            
-            # 早期停止: 十分良い解が見つかったらリスタートを打ち切る
-            if max(best_loss_list) < self.early_stop_threshold:
-                break
         
         # Generate final reconstruction
         best_z = torch.stack([z if z is not None else torch.randn(self.latent_dim, device=self.device) 
@@ -408,18 +391,37 @@ def load_cached_samples(cached_path):
 
 # ========== FGSM攻撃 ==========
 def fgsm_attack(model, x, y, epsilon, device):
-    """FGSM攻撃"""
-    x = x.clone().to(device)
-    x.requires_grad = True
+    """
+    FGSM攻撃 (L_inf)
     
-    outputs = model(x)
-    loss = F.cross_entropy(outputs, y.to(device))
+    Args:
+        model: 分類器（入力は[0,1]のRGB画像）
+        x: 入力画像 [B, 3, H, W] in [0, 1]
+        y: ラベル [B]
+        epsilon: 摂動の最大値（ピクセルスケール 0-1）
+        device: デバイス
+    
+    Returns:
+        x_adv: 敵対的画像 [B, 3, H, W] in [0, 1]
+    """
+    x_orig = x.clone().detach().to(device)
+    y = y.clone().detach().to(device)
+    
+    x_adv = x_orig.clone()
+    x_adv.requires_grad = True
+    
+    outputs = model(x_adv)
+    loss = F.cross_entropy(outputs, y)
+    
+    model.zero_grad()
     loss.backward()
+    grad = x_adv.grad.data
     
-    x_adv = x + epsilon * x.grad.sign()
-    x_adv = torch.clamp(x_adv, 0, 1)
+    # FGSM更新
+    x_adv = x_orig + epsilon * grad.sign()
+    x_adv = torch.clamp(x_adv, 0.0, 1.0).detach()
     
-    return x_adv.detach()
+    return x_adv
 
 
 # ========== 精度計算 ==========
@@ -444,21 +446,14 @@ def get_accuracy(model, x, y, bs=32, device=None):
     return correct / len(x)
 
 
-# ========== Defense-GAN浄化の精度計算と予測取得（統合版）==========
-def get_accuracy_and_predictions_with_defense(model, x, y, defense_gan, bs=4, device=None):
-    """
-    Defense-GANによる浄化後の精度と予測を同時に計算（重複計算を削減）
-    
-    Returns:
-        accuracy: 精度
-        predictions: 予測ラベル (numpy array)
-    """
+# ========== Defense-GAN浄化の精度計算 ==========
+def get_accuracy_with_defense(model, x, y, defense_gan, bs=1, device=None):
+    """Defense-GANによる浄化後の精度を計算"""
     if device is None:
         device = next(model.parameters()).device
     
     n_batches = (len(x) + bs - 1) // bs
     correct = 0
-    all_preds = []
     
     for i in tqdm(range(n_batches), desc="Defense-GAN Purification"):
         start_idx = i * bs
@@ -473,18 +468,8 @@ def get_accuracy_and_predictions_with_defense(model, x, y, defense_gan, bs=4, de
             outputs = model(x_purified)
             preds = outputs.argmax(dim=1)
             correct += (preds == y_batch).sum().item()
-            all_preds.append(preds.cpu())
     
-    accuracy = correct / len(x)
-    predictions = torch.cat(all_preds).numpy()
-    
-    return accuracy, predictions
-
-
-def get_accuracy_with_defense(model, x, y, defense_gan, bs=4, device=None):
-    """Defense-GANによる浄化後の精度を計算（互換性維持）"""
-    accuracy, _ = get_accuracy_and_predictions_with_defense(model, x, y, defense_gan, bs, device)
-    return accuracy
+    return correct / len(x)
 
 
 # ========== 予測取得 ==========
@@ -507,10 +492,27 @@ def get_predictions(model, x, bs=32, device=None):
     return torch.cat(preds).numpy()
 
 
-def get_predictions_with_defense(model, x, y, defense_gan, bs=4, device=None):
-    """Defense-GANによる浄化後の予測を取得（互換性維持）"""
-    _, predictions = get_accuracy_and_predictions_with_defense(model, x, y, defense_gan, bs, device)
-    return predictions
+def get_predictions_with_defense(model, x, defense_gan, bs=1, device=None):
+    """Defense-GANによる浄化後の予測を取得"""
+    if device is None:
+        device = next(model.parameters()).device
+    
+    n_batches = (len(x) + bs - 1) // bs
+    preds = []
+    
+    for i in tqdm(range(n_batches), desc="Getting predictions with defense"):
+        start_idx = i * bs
+        end_idx = min((i + 1) * bs, len(x))
+        x_batch = x[start_idx:end_idx].to(device)
+        
+        # Defense-GANで浄化
+        x_purified = defense_gan.reconstruct(x_batch)
+        
+        with torch.no_grad():
+            outputs = model(x_purified)
+            preds.append(outputs.argmax(dim=1).cpu())
+    
+    return torch.cat(preds).numpy()
 
 
 # ========== 混同行列出力 ==========
@@ -615,14 +617,8 @@ def main():
         rec_iters=args.rec_iters,
         rec_lr=args.rec_lr,
         rec_rr=args.rec_rr,
-        early_stop_threshold=args.early_stop_threshold,
         device=device
     )
-    
-    # 推定実行時間を表示
-    estimated_time_per_sample = args.rec_iters * args.rec_rr * 0.008  # 約8ms/iteration
-    estimated_total = estimated_time_per_sample * 500 * 4  # 4回の浄化処理
-    print(f"Estimated time: ~{estimated_total/60:.1f} minutes (with early stopping, likely faster)")
     
     # ラッパー作成
     classifier_model = ViTClassifierWrapper(classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
@@ -650,8 +646,7 @@ def main():
     
     # ========== 2. クリーン画像を浄化した後の精度 ==========
     print("\n[2/4] Evaluating clean images with Defense-GAN purification...")
-    clean_purified_acc, pred_clean_purified = get_accuracy_and_predictions_with_defense(
-        classifier_model, x_test, y_test, defense_gan, bs=4, device=device)
+    clean_purified_acc = get_accuracy_with_defense(classifier_model, x_test, y_test, defense_gan, bs=1, device=device)
     print(f"Clean accuracy (with Defense-GAN): {clean_purified_acc:.4f}")
     results['clean_acc_with_gan'] = clean_purified_acc
     
@@ -668,8 +663,7 @@ def main():
     
     # ========== 4. 敵対的画像を浄化した後の精度（防御あり） ==========
     print("\n[4/4] Evaluating adversarial images with Defense-GAN purification...")
-    adv_defended_acc, pred_adv_defended = get_accuracy_and_predictions_with_defense(
-        classifier_model, x_adv, y_test, defense_gan, bs=4, device=device)
+    adv_defended_acc = get_accuracy_with_defense(classifier_model, x_adv, y_test, defense_gan, bs=1, device=device)
     print(f"Adversarial accuracy (with Defense-GAN): {adv_defended_acc:.4f}")
     results['adv_acc_with_gan'] = adv_defended_acc
     
@@ -703,10 +697,11 @@ def main():
     print("Confusion Matrices")
     print(f"{'='*70}")
     
-    # 予測取得（Defense-GAN処理済みの予測は既に取得済み）
+    # 予測取得
     pred_clean = get_predictions(classifier_model, x_test, bs=args.batch_size, device=device)
+    pred_clean_purified = get_predictions_with_defense(classifier_model, x_test, defense_gan, bs=1, device=device)
     pred_adv_no_def = get_predictions(classifier_model, x_adv, bs=args.batch_size, device=device)
-    # pred_clean_purified と pred_adv_defended は上で既に取得済み
+    pred_adv_defended = get_predictions_with_defense(classifier_model, x_adv, defense_gan, bs=1, device=device)
     
     y_true = y_test.cpu().numpy()
     
