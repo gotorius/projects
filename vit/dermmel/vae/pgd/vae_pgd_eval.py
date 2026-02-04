@@ -396,6 +396,43 @@ def get_accuracy(model, x, y, bs=32, device=None):
     return accuracy, np.array(all_preds)
 
 
+def print_confusion_matrix(y_true, y_pred, title, classes, file=None):
+    """混同行列を出力"""
+    cm = confusion_matrix(y_true, y_pred)
+    
+    # メトリクス計算
+    tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    
+    def write_and_print(text):
+        print(text)
+        if file:
+            file.write(text + '\n')
+    
+    write_and_print(f"\n{title}")
+    write_and_print("-" * 60)
+    
+    header = f"{'':>15}" + "".join([f"Pred {c:>8}" for c in classes])
+    write_and_print(header)
+    
+    for i, true_class in enumerate(classes):
+        row = f"{'True ' + true_class:>15}" + "".join([f"{cm[i, j]:>12}" for j in range(len(classes))])
+        write_and_print(row)
+    
+    write_and_print(f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+    
+    return {
+        'cm': cm,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
+
+
 # ========== メイン ==========
 def main():
     args = parse_args()
@@ -407,16 +444,27 @@ def main():
     
     # デバイス設定
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
-    print(f"\n{'='*60}")
-    print("DermMel VAE (MagNet) PGD Evaluation (ViT)")
-    print(f"{'='*60}")
-    print(f"Device: {device}")
-    print(f"Epsilon: {args.epsilon:.5f} ({args.epsilon*255:.1f}/255)")
-    print(f"Alpha: {args.alpha:.5f} ({args.alpha*255:.1f}/255)")
-    print(f"PGD Steps: {args.pgd_steps}")
     
-    # 出力ディレクトリ作成
-    os.makedirs(args.output_dir, exist_ok=True)
+    # 出力ディレクトリ作成 (MMDDHHMM形式)
+    timestamp = datetime.now().strftime("%m%d%H%M")
+    log_dir = os.path.join(args.output_dir, timestamp)
+    os.makedirs(log_dir, exist_ok=True)
+    print(f"Output directory: {log_dir}")
+    
+    # 結果ファイル
+    results_file = open(os.path.join(log_dir, 'results.txt'), 'w')
+    
+    def write_and_print(text):
+        print(text)
+        results_file.write(text + '\n')
+    
+    write_and_print(f"\n{'='*70}")
+    write_and_print("PGD Attack + VAE Defense Evaluation (ViT Classifier) - DermMel")
+    write_and_print(f"{'='*70}")
+    write_and_print(f"Device: {device}")
+    write_and_print(f"Epsilon: {args.epsilon:.5f} ({args.epsilon*255:.1f}/255)")
+    write_and_print(f"Alpha: {args.alpha:.5f} ({args.alpha*255:.1f}/255)")
+    write_and_print(f"PGD Steps: {args.pgd_steps}")
     
     # データ読み込み
     x_test, y_test, classes = load_cached_samples(args.cached_samples)
@@ -470,69 +518,74 @@ def main():
     adv_vae_acc, adv_vae_preds = get_accuracy(vae_clf_wrapper, x_adv, y_test, args.batch_size, device)
     print(f"  Adversarial + VAE accuracy: {adv_vae_acc:.4f} ({adv_vae_acc*100:.2f}%)")
     
-    # ========== 結果サマリー ==========
-    print(f"\n{'='*60}")
-    print("SUMMARY")
-    print(f"{'='*60}")
-    print(f"Dataset: DermMel")
-    print(f"Model: ViT-B/16")
-    print(f"Attack: PGD (eps={args.epsilon:.5f}, alpha={args.alpha:.5f}, steps={args.pgd_steps})")
-    print(f"Defense: VAE (MagNet-style)")
-    print(f"-" * 60)
-    print(f"{'Condition':<35} {'Accuracy':>10}")
-    print(f"-" * 60)
-    print(f"{'Clean':<35} {clean_acc:>10.4f}")
-    print(f"{'Clean + VAE':<35} {clean_vae_acc:>10.4f}")
-    print(f"{'PGD (no defense)':<35} {adv_acc:>10.4f}")
-    print(f"{'PGD + VAE':<35} {adv_vae_acc:>10.4f}")
-    print(f"{'='*60}")
-    print(f"Defense improvement: {adv_vae_acc - adv_acc:+.4f} ({(adv_vae_acc - adv_acc)*100:+.2f}%)")
-    print(f"Clean accuracy drop: {clean_vae_acc - clean_acc:+.4f} ({(clean_vae_acc - clean_acc)*100:+.2f}%)")
-    
-    # 結果保存
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    # ========== 最終結果 ==========
     results = {
-        'dataset': 'dermmel',
-        'model': 'ViT-B/16',
-        'attack': 'PGD',
-        'defense': 'VAE (MagNet)',
-        'epsilon': args.epsilon,
-        'alpha': args.alpha,
-        'pgd_steps': args.pgd_steps,
         'clean_acc': clean_acc,
-        'clean_vae_acc': clean_vae_acc,
-        'adv_acc': adv_acc,
-        'adv_vae_acc': adv_vae_acc,
+        'clean_acc_with_vae': clean_vae_acc,
+        'adv_acc_no_defense': adv_acc,
+        'adv_acc_with_vae': adv_vae_acc,
         'defense_improvement': adv_vae_acc - adv_acc,
-        'clean_acc_drop': clean_vae_acc - clean_acc,
-        'n_samples': len(x_test),
-        'timestamp': timestamp
+        'clean_acc_drop': clean_vae_acc - clean_acc
     }
     
-    result_path = os.path.join(args.output_dir, f'pgd_vae_results_{timestamp}.json')
-    with open(result_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"\nResults saved to: {result_path}")
+    write_and_print(f"\n{'='*70}")
+    write_and_print("FINAL RESULTS (ViT Classifier) - DermMel")
+    write_and_print(f"{'='*70}")
+    write_and_print(f"Classifier: ViT-B/16")
+    write_and_print(f"Attack: PGD, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
+    write_and_print(f"        Alpha: {args.alpha:.4f} ({args.alpha*255:.1f}/255), Steps: {args.pgd_steps}")
+    write_and_print(f"Defense: VAE (MagNet-style)")
+    write_and_print(f"-"*70)
+    write_and_print("Clean Accuracy:")
+    write_and_print(f"  Classifier only:             {results['clean_acc']:.4f}")
+    write_and_print(f"  With VAE purification:       {results['clean_acc_with_vae']:.4f}")
+    write_and_print(f"-"*70)
+    write_and_print("Adversarial Accuracy (PGD):")
+    write_and_print(f"  Without defense:             {results['adv_acc_no_defense']:.4f}")
+    write_and_print(f"  With VAE purification:       {results['adv_acc_with_vae']:.4f}")
+    write_and_print(f"  Defense improvement:         {results['defense_improvement']:+.4f}")
+    write_and_print(f"-"*70)
+    write_and_print(f"Clean accuracy drop:           {results['clean_acc_drop']:+.4f}")
+    write_and_print(f"{'='*70}")
+    
+    # 混同行列
+    write_and_print(f"\n{'='*70}")
+    write_and_print("Confusion Matrices")
+    write_and_print(f"{'='*70}")
+    
+    y_true = y_test.numpy()
+    cm_results = {}
+    cm_results['clean'] = print_confusion_matrix(y_true, clean_preds, "1. Clean Images", classes, results_file)
+    cm_results['clean_vae'] = print_confusion_matrix(y_true, clean_vae_preds, "2. Clean Images (with VAE)", classes, results_file)
+    cm_results['adv_no_defense'] = print_confusion_matrix(y_true, adv_preds, "3. Adversarial Images (No Defense)", classes, results_file)
+    cm_results['adv_vae'] = print_confusion_matrix(y_true, adv_vae_preds, "4. Adversarial Images (with VAE)", classes, results_file)
     
     # 可視化サンプル保存
-    n_vis = min(8, len(x_test))
-    vis_dir = os.path.join(args.output_dir, 'visualizations')
-    os.makedirs(vis_dir, exist_ok=True)
+    write_and_print("\nSaving sample images...")
+    samples_dir = os.path.join(log_dir, 'samples')
+    os.makedirs(samples_dir, exist_ok=True)
     
-    # VAE浄化画像を生成
+    n_vis = min(8, len(x_test))
     with torch.no_grad():
-        x_vae = vae.reconstruct(x_adv[:n_vis].to(device)).cpu()
+        x_vae_clean = vae.reconstruct(x_test[:n_vis].to(device)).cpu()
+        x_vae_adv = vae.reconstruct(x_adv[:n_vis].to(device)).cpu()
     
     comparison = torch.cat([
         x_test[:n_vis],      # Clean
         x_adv[:n_vis],       # Adversarial
-        x_vae                # Adversarial + VAE
+        x_vae_clean,         # Clean + VAE
+        x_vae_adv            # Adversarial + VAE
     ], dim=0)
     
     grid = make_grid(comparison, nrow=n_vis, normalize=False, padding=2)
-    save_path = os.path.join(vis_dir, f'comparison_pgd_{timestamp}.png')
+    save_path = os.path.join(samples_dir, 'comparison_pgd.png')
     save_image(grid, save_path)
-    print(f"Visualization saved to: {save_path}")
+    write_and_print(f"Visualization saved to: {save_path}")
+    
+    results_file.close()
+    
+    print(f"\nResults saved to {log_dir}")
+    print(f"Text results: {os.path.join(log_dir, 'results.txt')}")
 
 
 if __name__ == '__main__':
