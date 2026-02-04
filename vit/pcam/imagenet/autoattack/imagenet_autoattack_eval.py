@@ -69,7 +69,7 @@ def parse_args():
                         help='DDIM sampling eta (0=deterministic)')
     
     # 実行設定
-    parser.add_argument('--batch_size', type=int, default=8,
+    parser.add_argument('--batch_size', type=int, default=16,
                         help='Batch size for evaluation')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
@@ -89,7 +89,7 @@ def parse_args():
                         help='Output directory')
     
     # GPU設定
-    parser.add_argument('--gpu', type=int, default=0,
+    parser.add_argument('--gpu', type=int, default=2,
                         help='GPU ID to use')
     
     return parser.parse_args()
@@ -493,17 +493,8 @@ def main():
     print(f"Clean accuracy (ViT classifier): {clean_acc:.4f}")
     results['clean_acc_classifier'] = clean_acc
     
-    # ========== 2. クリーン画像を浄化した後の精度 ==========
-    print("\n[2/4] Evaluating clean images with Guided-Diffusion purification...")
-    pred_clean_purified, clean_purified_acc = get_predictions_and_accuracy_with_purification(
-        classifier_model, purifier, x_test, y_test, bs=4, device=device,
-        desc="Evaluating clean images (with purification)"
-    )
-    print(f"Clean accuracy (with purification): {clean_purified_acc:.4f}")
-    results['clean_acc_with_diffusion'] = clean_purified_acc
-    
-    # ========== 3. AutoAttack ==========
-    print("\n[3/4] Running AutoAttack...")
+    # ========== 2. AutoAttack ==========
+    print("\n[2/3] Running AutoAttack...")
     start_time = time.time()
     
     adversary = AutoAttack(classifier_model, norm=args.norm, eps=args.epsilon, version=args.version, device=device)
@@ -520,8 +511,8 @@ def main():
     results['adv_acc_no_defense'] = adv_acc_no_defense
     results['attack_time'] = attack_time
     
-    # ========== 4. 敵対的画像を浄化した後の精度 ==========
-    print("\n[4/4] Evaluating adversarial images with Guided-Diffusion purification...")
+    # ========== 3. 敵対的画像を浄化した後の精度 ==========
+    print("\n[3/3] Evaluating adversarial images with Guided-Diffusion purification...")
     pred_adv_defended, adv_defended_acc = get_predictions_and_accuracy_with_purification(
         classifier_model, purifier, x_adv, y_test, bs=4, device=device,
         desc="Evaluating adversarial images (with purification)"
@@ -543,7 +534,6 @@ def main():
     print(f"-"*70)
     print(f"Clean Accuracy:")
     print(f"  ViT classifier only:         {results['clean_acc_classifier']:.4f}")
-    print(f"  With Guided-Diffusion:       {results['clean_acc_with_diffusion']:.4f}")
     print(f"-"*70)
     print(f"Adversarial Accuracy (AutoAttack):")
     print(f"  Without defense:             {results['adv_acc_no_defense']:.4f}")
@@ -562,13 +552,11 @@ def main():
     y_true = y_test.cpu().numpy()
     
     cm_clean = print_confusion_matrix(y_true, pred_clean, "1. Clean Images (ViT classifier only)", classes)
-    cm_clean_purified = print_confusion_matrix(y_true, pred_clean_purified, "2. Clean Images (with Guided-Diffusion)", classes)
-    cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "3. AutoAttack Images (No Defense)", classes)
-    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "4. AutoAttack Images (with Guided-Diffusion)", classes)
+    cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "2. AutoAttack Images (No Defense)", classes)
+    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "3. AutoAttack Images (with Guided-Diffusion)", classes)
     
     results['confusion_matrices'] = {
         'clean': cm_clean,
-        'clean_purified': cm_clean_purified,
         'adv_no_defense': cm_adv_no_def,
         'adv_defended': cm_adv_defended
     }
@@ -623,8 +611,7 @@ def main():
         f.write("-"*70 + "\n\n")
         
         f.write("Clean Accuracy:\n")
-        f.write(f"  ViT classifier only:         {results['clean_acc_classifier']:.4f}\n")
-        f.write(f"  With Guided-Diffusion:       {results['clean_acc_with_diffusion']:.4f}\n\n")
+        f.write(f"  ViT classifier only:         {results['clean_acc_classifier']:.4f}\n\n")
         
         f.write("Adversarial Accuracy (AutoAttack):\n")
         f.write(f"  Without defense:             {results['adv_acc_no_defense']:.4f}\n")
@@ -646,7 +633,6 @@ def main():
         'diffusion_T_purify': args.T_purify,
         'args': vars(args),
         'clean_acc_classifier': results['clean_acc_classifier'],
-        'clean_acc_with_diffusion': results['clean_acc_with_diffusion'],
         'adv_acc_no_defense': results['adv_acc_no_defense'],
         'adv_acc_with_diffusion': results['adv_acc_with_diffusion'],
         'defense_improvement': results['defense_improvement'],

@@ -16,8 +16,8 @@ python jpeg_fgsm_eval.py
 # パラメータ指定
 python jpeg_fgsm_eval.py \
     --epsilon 0.03137 \
-    --quality 11 \
-    --gpu 0
+    --quality 75 \
+    --gpu 1
 """
 
 import os
@@ -51,7 +51,7 @@ def parse_args():
                         help='FGSM perturbation epsilon (pixel scale 0-1)')
     
     # JPEG圧縮設定
-    parser.add_argument('--quality', type=int, default=11,
+    parser.add_argument('--quality', type=int, default=75,
                         help='JPEG compression quality (1-100, lower = more compression)')
     
     # 実行設定
@@ -72,7 +72,7 @@ def parse_args():
                         help='Output directory')
     
     # GPU設定
-    parser.add_argument('--gpu', type=int, default=0,
+    parser.add_argument('--gpu', type=int, default=1,
                         help='GPU ID to use')
     
     return parser.parse_args()
@@ -234,13 +234,12 @@ def load_classifier(args, device):
 
 # ========== 精度計算 ==========
 def get_accuracy(model, x, y, bs=32, device=None):
-    """精度を計算"""
+    """モデルの精度を計算"""
     if device is None:
         device = next(model.parameters()).device
     
     n_batches = (len(x) + bs - 1) // bs
     correct = 0
-    all_preds = []
     
     with torch.no_grad():
         for i in range(n_batches):
@@ -248,148 +247,312 @@ def get_accuracy(model, x, y, bs=32, device=None):
             end_idx = min((i + 1) * bs, len(x))
             x_batch = x[start_idx:end_idx].to(device)
             y_batch = y[start_idx:end_idx].to(device)
-            
             outputs = model(x_batch)
             preds = outputs.argmax(dim=1)
             correct += (preds == y_batch).sum().item()
-            all_preds.extend(preds.cpu().numpy())
     
-    accuracy = correct / len(x)
-    return accuracy, np.array(all_preds)
+    return correct / len(x)
+
+
+# ========== 予測取得 ==========
+def get_predictions(model, x, bs=32, device=None):
+    """モデルの予測を取得"""
+    if device is None:
+        device = next(model.parameters()).device
+    
+    n_batches = (len(x) + bs - 1) // bs
+    preds = []
+    
+    with torch.no_grad():
+        for i in range(n_batches):
+            start_idx = i * bs
+            end_idx = min((i + 1) * bs, len(x))
+            x_batch = x[start_idx:end_idx].to(device)
+            outputs = model(x_batch)
+            preds.append(outputs.argmax(dim=1).cpu())
+    
+    return torch.cat(preds).numpy()
+
+
+# ========== 混同行列出力 ==========
+def print_confusion_matrix(y_true, y_pred, title, classes=None):
+    """混同行列をテキスト出力"""
+    cm = confusion_matrix(y_true, y_pred)
+    if cm.size == 4:
+        tn, fp, fn, tp = cm.ravel()
+        precision = tp/(tp+fp) if (tp+fp)>0 else 0.0
+        recall = tp/(tp+fn) if (tp+fn)>0 else 0.0
+        f1 = 2*precision*recall/(precision+recall) if (precision+recall)>0 else 0.0
+        accuracy = (tn + tp) / (tn + fp + fn + tp)
+        
+        print(f"\n{title}:")
+        if classes:
+            print(f"  Classes: {classes}")
+        print(f"  TN: {tn:4d}  FP: {fp:4d}")
+        print(f"  FN: {fn:4d}  TP: {tp:4d}")
+        print(f"  Accuracy: {accuracy:.4f}")
+        print(f"  Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+        return {'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp, 
+                'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1}
+    return {}
+
+
+# ========== FGSM攻撃実行 ==========
+def run_fgsm_attack(model, x_test, y_test, epsilon, device, batch_size=32):
+    """FGSM攻撃を実行して敵対的サンプルを生成"""
+    print(f"\nRunning FGSM attack with epsilon={epsilon:.4f}...")
+    
+    n_batches = (len(x_test) + batch_size - 1) // batch_size
+    x_adv_list = []
+    
+    for i in tqdm(range(n_batches), desc="FGSM Attack"):
+        start_idx = i * batch_size
+        end_idx = min((i + 1) * batch_size, len(x_test))
+        x_batch = x_test[start_idx:end_idx].to(device)
+        y_batch = y_test[start_idx:end_idx].to(device)
+        
+        x_adv_batch = fgsm_attack(model, x_batch, y_batch, epsilon, device)
+        x_adv_list.append(x_adv_batch.cpu())
+    
+    x_adv = torch.cat(x_adv_list, dim=0)
+    print(f"Generated {len(x_adv)} adversarial samples")
+    
+    return x_adv
+
+
+# ========== サンプル画像保存 ==========
+def save_sample_images(x_clean, x_adv, x_compressed_clean, x_compressed_adv, 
+                       y_true, classes, save_dir, max_samples=10):
+    """サンプル画像を保存"""
+    os.makedirs(save_dir, exist_ok=True)
+    n = min(len(x_clean), max_samples)
+    
+    for i in range(n):
+        label = int(y_true[i])
+        label_name = classes[label] if classes else str(label)
+        
+        # 4枚を並べて保存: Clean, Clean+JPEG, Adv, Adv+JPEG
+        quad = torch.cat([
+            x_clean[i:i+1],
+            x_compressed_clean[i:i+1],
+            x_adv[i:i+1],
+            x_compressed_adv[i:i+1]
+        ], dim=0)
+        grid = make_grid(quad, nrow=4, padding=5, pad_value=1.0)
+        save_image(grid, os.path.join(save_dir, f"{i:04d}_{label_name}.png"))
+    
+    print(f"Saved {n} sample images to {save_dir}")
+    print(f"  Format: [Clean | Clean+JPEG | Adversarial | Adv+JPEG]")
 
 
 # ========== メイン ==========
 def main():
     args = parse_args()
     
-    # シード設定
+    # 乱数シード
     torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
     random.seed(args.seed)
+    np.random.seed(args.seed)
     
-    # デバイス設定
+    # GPU設定
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
-    print(f"\n{'='*60}")
-    print("DermMel FGSM Attack + JPEG Defense Evaluation (ViT)")
-    print(f"{'='*60}")
+    print(f"\nUsing GPU: {args.gpu}")
     print(f"Device: {device}")
-    print(f"Epsilon: {args.epsilon:.5f} ({args.epsilon*255:.1f}/255)")
-    print(f"JPEG Quality: {args.quality}")
     
-    # 出力ディレクトリ作成
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # データ読み込み
-    x_test, y_test, classes = load_cached_samples(args.cached_samples)
+    # 出力ディレクトリ
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.join(args.output_dir, f"fgsm_eps{args.epsilon:.4f}_q{args.quality}_{timestamp}")
+    os.makedirs(log_dir, exist_ok=True)
+    print(f"Output directory: {log_dir}")
     
     # モデル読み込み
     classifier = load_classifier(args, device)
     
-    # ラッパー作成
-    clf_wrapper = ViTClassifierWrapper(classifier, IMAGENET_MEAN, IMAGENET_STD).to(device)
-    clf_wrapper.eval()
-    
     # JPEG防御
     jpeg_defense = JPEGDefense(quality=args.quality)
-    jpeg_clf_wrapper = JPEGDefenseWrapper(jpeg_defense, classifier, IMAGENET_MEAN, IMAGENET_STD).to(device)
-    jpeg_clf_wrapper.eval()
+    
+    # ラッパー作成
+    classifier_model = ViTClassifierWrapper(classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
+    defense_model = JPEGDefenseWrapper(jpeg_defense, classifier, IMAGENET_MEAN, IMAGENET_STD).to(device).eval()
+    
+    # データ読み込み
+    x_test, y_test, classes = load_cached_samples(args.cached_samples)
+    print(f"Classes: {classes}")
+    
+    # ==================== 評価開始 ====================
+    print(f"\n{'='*70}")
+    print("FGSM Attack + JPEG Compression Defense Evaluation (ViT Classifier)")
+    print(f"{'='*70}")
+    print(f"Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
+    print(f"JPEG Quality: {args.quality}")
+    print(f"Samples: {len(x_test)}")
+    print(f"{'='*70}")
+    
+    results = {}
     
     # ========== 1. クリーン画像の精度 ==========
-    print(f"\n[1/4] Evaluating clean images...")
-    clean_acc, clean_preds = get_accuracy(clf_wrapper, x_test, y_test, args.batch_size, device)
-    print(f"  Clean accuracy: {clean_acc:.4f} ({clean_acc*100:.2f}%)")
+    print("\n[1/4] Evaluating clean images (ViT classifier only)...")
+    clean_acc = get_accuracy(classifier_model, x_test, y_test, bs=args.batch_size, device=device)
+    print(f"Clean accuracy (ViT classifier): {clean_acc:.4f}")
+    results['clean_acc_classifier'] = clean_acc
     
-    # ========== 2. クリーン画像 + JPEG圧縮の精度 ==========
-    print(f"\n[2/4] Evaluating clean images + JPEG compression (quality={args.quality})...")
-    clean_jpeg_acc, clean_jpeg_preds = get_accuracy(jpeg_clf_wrapper, x_test, y_test, args.batch_size, device)
-    print(f"  Clean + JPEG accuracy: {clean_jpeg_acc:.4f} ({clean_jpeg_acc*100:.2f}%)")
+    # ========== 2. クリーン画像をJPEG圧縮した後の精度 ==========
+    print("\n[2/4] Evaluating clean images with JPEG compression...")
+    clean_compressed_acc = get_accuracy(defense_model, x_test, y_test, bs=args.batch_size, device=device)
+    print(f"Clean accuracy (with JPEG q={args.quality}): {clean_compressed_acc:.4f}")
+    results['clean_acc_with_jpeg'] = clean_compressed_acc
     
-    # ========== 3. FGSM敵対的画像の生成と評価 ==========
-    print(f"\n[3/4] Generating FGSM adversarial examples (eps={args.epsilon:.5f})...")
+    # ========== 3. FGSM攻撃 & 敵対的画像の精度（防御なし） ==========
+    print("\n[3/4] Running FGSM attack and evaluating adversarial images...")
+    start_time = time.time()
+    x_adv = run_fgsm_attack(classifier_model, x_test, y_test, args.epsilon, device, args.batch_size)
+    attack_time = time.time() - start_time
     
-    x_adv_list = []
-    n_batches = (len(x_test) + args.batch_size - 1) // args.batch_size
+    adv_acc_no_defense = get_accuracy(classifier_model, x_adv, y_test, bs=args.batch_size, device=device)
+    print(f"Adversarial accuracy (no defense): {adv_acc_no_defense:.4f}")
+    results['adv_acc_no_defense'] = adv_acc_no_defense
+    results['attack_time'] = attack_time
     
-    for i in tqdm(range(n_batches), desc="FGSM attack"):
-        start_idx = i * args.batch_size
-        end_idx = min((i + 1) * args.batch_size, len(x_test))
-        x_batch = x_test[start_idx:end_idx]
-        y_batch = y_test[start_idx:end_idx]
-        
-        x_adv_batch = fgsm_attack(clf_wrapper, x_batch, y_batch, args.epsilon, device)
-        x_adv_list.append(x_adv_batch.cpu())
+    # ========== 4. 敵対的画像をJPEG圧縮した後の精度（防御あり） ==========
+    print("\n[4/4] Evaluating adversarial images with JPEG compression...")
+    adv_defended_acc = get_accuracy(defense_model, x_adv, y_test, bs=args.batch_size, device=device)
+    print(f"Adversarial accuracy (with JPEG q={args.quality}): {adv_defended_acc:.4f}")
+    results['adv_acc_with_jpeg'] = adv_defended_acc
     
-    x_adv = torch.cat(x_adv_list, dim=0)
+    # 防御効果
+    defense_improvement = adv_defended_acc - adv_acc_no_defense
+    results['defense_improvement'] = defense_improvement
     
-    # 敵対的画像の精度（防御なし）
-    adv_acc, adv_preds = get_accuracy(clf_wrapper, x_adv, y_test, args.batch_size, device)
-    print(f"  Adversarial accuracy (no defense): {adv_acc:.4f} ({adv_acc*100:.2f}%)")
+    # ==================== 最終結果 ====================
+    print(f"\n{'='*70}")
+    print("FINAL RESULTS")
+    print(f"{'='*70}")
+    print(f"Classifier: ViT-B/16")
+    print(f"Attack: FGSM, Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)")
+    print(f"JPEG Defense: quality={args.quality}")
+    print(f"-"*70)
+    print(f"Clean Accuracy:")
+    print(f"  ViT classifier only:      {results['clean_acc_classifier']:.4f}")
+    print(f"  With JPEG compression:    {results['clean_acc_with_jpeg']:.4f}")
+    print(f"-"*70)
+    print(f"Adversarial Accuracy (FGSM):")
+    print(f"  Without defense:          {results['adv_acc_no_defense']:.4f}")
+    print(f"  With JPEG compression:    {results['adv_acc_with_jpeg']:.4f}")
+    print(f"  Defense improvement:      {results['defense_improvement']:+.4f}")
+    print(f"-"*70)
+    print(f"Attack time: {results['attack_time']:.2f}s")
+    print(f"{'='*70}")
     
-    # ========== 4. FGSM敵対的画像 + JPEG圧縮の精度 ==========
-    print(f"\n[4/4] Evaluating adversarial images + JPEG compression...")
-    adv_jpeg_acc, adv_jpeg_preds = get_accuracy(jpeg_clf_wrapper, x_adv, y_test, args.batch_size, device)
-    print(f"  Adversarial + JPEG accuracy: {adv_jpeg_acc:.4f} ({adv_jpeg_acc*100:.2f}%)")
+    # ==================== 混同行列 ====================
+    print(f"\n{'='*70}")
+    print("Confusion Matrices")
+    print(f"{'='*70}")
     
-    # ========== 結果サマリー ==========
-    print(f"\n{'='*60}")
-    print("SUMMARY")
-    print(f"{'='*60}")
-    print(f"Dataset: DermMel")
-    print(f"Model: ViT-B/16")
-    print(f"Attack: FGSM (eps={args.epsilon:.5f})")
-    print(f"Defense: JPEG Compression (quality={args.quality})")
-    print(f"-" * 60)
-    print(f"{'Condition':<35} {'Accuracy':>10}")
-    print(f"-" * 60)
-    print(f"{'Clean':<35} {clean_acc:>10.4f}")
-    print(f"{'Clean + JPEG':<35} {clean_jpeg_acc:>10.4f}")
-    print(f"{'FGSM (no defense)':<35} {adv_acc:>10.4f}")
-    print(f"{'FGSM + JPEG':<35} {adv_jpeg_acc:>10.4f}")
-    print(f"{'='*60}")
-    print(f"Defense improvement: {adv_jpeg_acc - adv_acc:+.4f} ({(adv_jpeg_acc - adv_acc)*100:+.2f}%)")
-    print(f"Clean accuracy drop: {clean_jpeg_acc - clean_acc:+.4f} ({(clean_jpeg_acc - clean_acc)*100:+.2f}%)")
+    # 予測取得
+    pred_clean = get_predictions(classifier_model, x_test, bs=args.batch_size, device=device)
+    pred_clean_compressed = get_predictions(defense_model, x_test, bs=args.batch_size, device=device)
+    pred_adv_no_def = get_predictions(classifier_model, x_adv, bs=args.batch_size, device=device)
+    pred_adv_defended = get_predictions(defense_model, x_adv, bs=args.batch_size, device=device)
     
-    # 結果保存
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    results = {
-        'dataset': 'dermmel',
-        'model': 'ViT-B/16',
-        'attack': 'FGSM',
-        'epsilon': args.epsilon,
-        'jpeg_quality': args.quality,
-        'clean_acc': clean_acc,
-        'clean_jpeg_acc': clean_jpeg_acc,
-        'adv_acc': adv_acc,
-        'adv_jpeg_acc': adv_jpeg_acc,
-        'defense_improvement': adv_jpeg_acc - adv_acc,
-        'clean_acc_drop': clean_jpeg_acc - clean_acc,
-        'n_samples': len(x_test),
-        'timestamp': timestamp
+    y_true = y_test.cpu().numpy()
+    
+    cm_clean = print_confusion_matrix(y_true, pred_clean, "1. Clean Images (ViT classifier only)", classes)
+    cm_clean_compressed = print_confusion_matrix(y_true, pred_clean_compressed, "2. Clean Images (with JPEG)", classes)
+    cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "3. Adversarial Images (No Defense)", classes)
+    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "4. Adversarial Images (with JPEG)", classes)
+    
+    results['confusion_matrices'] = {
+        'clean': cm_clean,
+        'clean_compressed': cm_clean_compressed,
+        'adv_no_defense': cm_adv_no_def,
+        'adv_defended': cm_adv_defended
     }
     
-    result_path = os.path.join(args.output_dir, f'fgsm_jpeg_results_{timestamp}.json')
-    with open(result_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"\nResults saved to: {result_path}")
+    # ==================== 圧縮画像を生成して保存 ====================
+    print("\nGenerating compressed samples for visualization...")
+    n_samples = min(10, len(x_test))
+    x_compressed_clean = jpeg_defense(x_test[:n_samples])
+    x_compressed_adv = jpeg_defense(x_adv[:n_samples])
     
-    # 可視化サンプル保存
-    n_vis = min(8, len(x_test))
-    vis_dir = os.path.join(args.output_dir, 'visualizations')
-    os.makedirs(vis_dir, exist_ok=True)
+    save_sample_images(
+        x_test[:n_samples].cpu(), 
+        x_adv[:n_samples].cpu(),
+        x_compressed_clean,
+        x_compressed_adv,
+        y_test[:n_samples].cpu().numpy(), 
+        classes,
+        os.path.join(log_dir, 'samples')
+    )
     
-    # クリーン vs 敵対的 vs JPEG圧縮後の比較
-    x_jpeg = jpeg_defense(x_adv[:n_vis].to(device)).cpu()
+    # ==================== 敵対的サンプル保存 ====================
+    torch.save({
+        'x_clean': x_test.cpu(),
+        'x_adv': x_adv.cpu(),
+        'y': y_test.cpu(),
+        'epsilon': args.epsilon,
+    }, os.path.join(log_dir, 'adversarial_samples.pt'))
+    print(f"Saved adversarial samples to: {os.path.join(log_dir, 'adversarial_samples.pt')}")
     
-    comparison = torch.cat([
-        x_test[:n_vis],      # Clean
-        x_adv[:n_vis],       # Adversarial
-        x_jpeg               # Adversarial + JPEG
-    ], dim=0)
+    # ==================== サマリー保存 ====================
+    summary_path = os.path.join(log_dir, 'summary.txt')
+    with open(summary_path, 'w') as f:
+        f.write("="*70 + "\n")
+        f.write("DermMel - FGSM Attack + JPEG Compression Defense (ViT Classifier)\n")
+        f.write("="*70 + "\n\n")
+        f.write(f"Classifier: ViT-B/16\n")
+        f.write(f"Attack: FGSM\n")
+        f.write(f"Epsilon: {args.epsilon:.4f} ({args.epsilon*255:.1f}/255)\n")
+        f.write(f"JPEG Defense: quality={args.quality}\n")
+        f.write(f"Samples: {len(x_test)}\n\n")
+        
+        f.write("-"*70 + "\n")
+        f.write("RESULTS\n")
+        f.write("-"*70 + "\n\n")
+        
+        f.write("Clean Accuracy:\n")
+        f.write(f"  ViT classifier only:      {results['clean_acc_classifier']:.4f}\n")
+        f.write(f"  With JPEG compression:    {results['clean_acc_with_jpeg']:.4f}\n\n")
+        
+        f.write("Adversarial Accuracy (FGSM):\n")
+        f.write(f"  Without defense:          {results['adv_acc_no_defense']:.4f}\n")
+        f.write(f"  With JPEG compression:    {results['adv_acc_with_jpeg']:.4f}\n")
+        f.write(f"  Defense improvement:      {results['defense_improvement']:+.4f}\n\n")
+        
+        f.write(f"Attack time: {results['attack_time']:.2f}s\n\n")
+        
+        f.write("-"*70 + "\n")
+        f.write("CONFUSION MATRICES\n")
+        f.write("-"*70 + "\n\n")
+        
+        for name, cm in [("Clean (ViT Classifier)", cm_clean), 
+                         ("Clean (with JPEG)", cm_clean_compressed),
+                         ("Adversarial (No Defense)", cm_adv_no_def),
+                         ("Adversarial (with JPEG)", cm_adv_defended)]:
+            if cm:
+                f.write(f"{name}:\n")
+                f.write(f"  TN: {cm['tn']:4d}  FP: {cm['fp']:4d}\n")
+                f.write(f"  FN: {cm['fn']:4d}  TP: {cm['tp']:4d}\n")
+                f.write(f"  Accuracy: {cm['accuracy']:.4f}\n")
+                f.write(f"  Precision: {cm['precision']:.4f}, Recall: {cm['recall']:.4f}, F1: {cm['f1']:.4f}\n\n")
     
-    grid = make_grid(comparison, nrow=n_vis, normalize=False, padding=2)
-    save_path = os.path.join(vis_dir, f'comparison_fgsm_{timestamp}.png')
-    save_image(grid, save_path)
-    print(f"Visualization saved to: {save_path}")
+    # JSON形式でも保存
+    results_json = {
+        'classifier': 'ViT-B/16',
+        'args': vars(args),
+        'clean_acc_classifier': results['clean_acc_classifier'],
+        'clean_acc_with_jpeg': results['clean_acc_with_jpeg'],
+        'adv_acc_no_defense': results['adv_acc_no_defense'],
+        'adv_acc_with_jpeg': results['adv_acc_with_jpeg'],
+        'defense_improvement': results['defense_improvement'],
+        'attack_time': results['attack_time'],
+    }
+    with open(os.path.join(log_dir, 'results.json'), 'w') as f:
+        json.dump(results_json, f, indent=2)
+    
+    print(f"\n✅ Results saved to: {log_dir}")
+    print(f"✅ Summary: {summary_path}")
+    
+    return results
 
 
 if __name__ == '__main__':

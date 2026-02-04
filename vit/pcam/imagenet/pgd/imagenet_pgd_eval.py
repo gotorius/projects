@@ -4,9 +4,8 @@ DiffPureスタイルの敵対的防御検証スクリプト
 
 評価内容:
 1. クリーン画像の分類精度
-2. クリーン画像を浄化した後の分類精度
-3. PGD敵対的画像の分類精度（防御なし）
-4. PGD敵対的画像を浄化した後の分類精度（防御あり）
+2. PGD敵対的画像の分類精度（防御なし）
+3. PGD敵対的画像を浄化した後の分類精度（防御あり）
 """
 
 """
@@ -538,27 +537,25 @@ def main():
     
     results = {}
     
-    # ========== 1&2. クリーン画像の精度（分類器のみ & 浄化あり）を同時に計算 ==========
-    print("\n[1&2/4] Evaluating clean images (classifier only and with Guided-Diffusion)...")
-    clean_acc, pred_clean, clean_purified_acc, pred_clean_purified = get_predictions_and_accuracy_with_purification(
-        classifier_model, defense_model, x_test, y_test, bs=args.batch_size, device=device,
+    # ========== 1. クリーン画像の精度（分類器のみ） ==========
+    print("\n[1/3] Evaluating clean images (classifier only)...")
+    pred_clean, clean_acc = get_predictions_and_accuracy(
+        classifier_model, x_test, y_test, bs=args.batch_size, device=device,
         desc="Clean images"
     )
     print(f"Clean accuracy (ViT classifier): {clean_acc:.4f}")
-    print(f"Clean accuracy (with Guided-Diffusion): {clean_purified_acc:.4f}")
     results['clean_acc_classifier'] = clean_acc
-    results['clean_acc_with_diffusion'] = clean_purified_acc
     
-    # ========== 3. PGD攻撃 & 敵対的画像の精度（防御なし） ==========
-    print("\n[3/4] Running PGD attack and evaluating adversarial images...")
+    # ========== 2. PGD攻撃 & 敵対的画像の精度（防御なし） ==========
+    print("\n[2/3] Running PGD attack and evaluating adversarial images...")
     start_time = time.time()
     x_adv = run_pgd_attack(classifier_model, x_test, y_test, args.epsilon, args.alpha, 
                            args.pgd_steps, device, args.batch_size, args.random_start)
     attack_time = time.time() - start_time
     results['attack_time'] = attack_time
     
-    # ========== 3&4. 敵対的画像の精度（防御なし & 防御あり）を同時に計算 ==========
-    print("\n[4/4] Evaluating adversarial images (no defense and with Guided-Diffusion)...")
+    # ========== 3. 敵対的画像の精度（防御なし & 防御あり）を同時に計算 ==========
+    print("\n[3/3] Evaluating adversarial images (no defense and with Guided-Diffusion)...")
     adv_acc_no_defense, pred_adv_no_def, adv_defended_acc, pred_adv_defended = get_predictions_and_accuracy_with_purification(
         classifier_model, defense_model, x_adv, y_test, bs=args.batch_size, device=device,
         desc="Adversarial images"
@@ -583,7 +580,6 @@ def main():
     print(f"-"*70)
     print(f"Clean Accuracy:")
     print(f"  ViT classifier only:           {results['clean_acc_classifier']:.4f}")
-    print(f"  With Guided-Diffusion:         {results['clean_acc_with_diffusion']:.4f}")
     print(f"-"*70)
     print(f"Adversarial Accuracy (PGD):")
     print(f"  Without defense:               {results['adv_acc_no_defense']:.4f}")
@@ -602,13 +598,11 @@ def main():
     y_true = y_test.cpu().numpy()
     
     cm_clean = print_confusion_matrix(y_true, pred_clean, "1. Clean Images (ViT classifier only)", classes)
-    cm_clean_purified = print_confusion_matrix(y_true, pred_clean_purified, "2. Clean Images (with Guided-Diffusion)", classes)
-    cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "3. Adversarial Images (No Defense)", classes)
-    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "4. Adversarial Images (with Guided-Diffusion)", classes)
+    cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "2. Adversarial Images (No Defense)", classes)
+    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "3. Adversarial Images (with Guided-Diffusion)", classes)
     
     results['confusion_matrices'] = {
         'clean': cm_clean,
-        'clean_purified': cm_clean_purified,
         'adv_no_defense': cm_adv_no_def,
         'adv_defended': cm_adv_defended
     }
@@ -668,8 +662,7 @@ def main():
         f.write("-"*70 + "\n\n")
         
         f.write("Clean Accuracy:\n")
-        f.write(f"  ViT classifier only:           {results['clean_acc_classifier']:.4f}\n")
-        f.write(f"  With Guided-Diffusion:         {results['clean_acc_with_diffusion']:.4f}\n\n")
+        f.write(f"  ViT classifier only:           {results['clean_acc_classifier']:.4f}\n\n")
         
         f.write("Adversarial Accuracy (PGD):\n")
         f.write(f"  Without defense:               {results['adv_acc_no_defense']:.4f}\n")
@@ -683,7 +676,6 @@ def main():
         f.write("-"*70 + "\n\n")
         
         for name, cm in [("Clean (ViT Classifier)", cm_clean), 
-                         ("Clean (with Guided-Diffusion)", cm_clean_purified),
                          ("Adversarial (No Defense)", cm_adv_no_def),
                          ("Adversarial (with Guided-Diffusion)", cm_adv_defended)]:
             if cm:
@@ -700,7 +692,6 @@ def main():
         'defense': 'Guided-Diffusion',
         'args': vars(args),
         'clean_acc_classifier': results['clean_acc_classifier'],
-        'clean_acc_with_diffusion': results['clean_acc_with_diffusion'],
         'adv_acc_no_defense': results['adv_acc_no_defense'],
         'adv_acc_with_diffusion': results['adv_acc_with_diffusion'],
         'defense_improvement': results['defense_improvement'],
