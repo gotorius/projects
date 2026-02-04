@@ -55,7 +55,7 @@ def parse_args():
                         help='AutoAttack version')
     
     # JPEG圧縮設定
-    parser.add_argument('--quality', type=int, default=11,
+    parser.add_argument('--quality', type=int, default=75,
                         help='JPEG compression quality (1-100, lower = more compression)')
     
     # 実行設定
