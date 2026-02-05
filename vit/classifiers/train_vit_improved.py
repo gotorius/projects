@@ -102,7 +102,7 @@ def get_args():
     parser = argparse.ArgumentParser(description='ViT Training (Improved) for Medical Images')
     
     # データセット設定
-    parser.add_argument('--dataset', type=str, default='pcam',
+    parser.add_argument('--dataset', type=str, default='all',
                         choices=['pcam', 'chestxray', 'dermmel', 'all'])
     
     # 訓練設定
@@ -135,10 +135,10 @@ def get_args():
     
     # その他
     parser.add_argument('--save_dir', type=str,
-                        default='/mnt/data1/gotou/projects/vit/classifiers/checkpoints')
+                        default='/mnt/data1/gotou/projects/vit/classifiers/checkpoints_v2')
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--gpu', type=int, default=2)
+    parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--label_smoothing', type=float, default=0.1)
     
     return parser.parse_args()

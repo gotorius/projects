@@ -87,7 +87,7 @@ def parse_args():
     # 実行設定
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size for evaluation')
-    parser.add_argument('--gpu', type=int, default=2,
+    parser.add_argument('--gpu', type=int, default=0,
                         help='GPU ID')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
@@ -288,7 +288,10 @@ class ViTClassifierWrapper(nn.Module):
         self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
     
     def forward(self, x):
-        x_norm = (x - self.mean) / self.std
+        # Ensure mean and std are on the same device as input x
+        mean = self.mean.to(x.device)
+        std = self.std.to(x.device)
+        x_norm = (x - mean) / std
         return self.classifier(x_norm)
 
 
