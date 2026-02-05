@@ -628,29 +628,45 @@ def main():
     
     results = {}
     
-    # ========== 1. クリーン画像の精度 ==========
-    print("\n[1/3] Evaluating clean images (ViT classifier only)...")
+    # ========== 1. クリーン画像の精度（防御なし） ==========
+    print("\n[1/4] Evaluating clean images (ViT classifier only)...")
+    clean_acc, pred_clean = get_accuracy_and_predictions_with_defense(
+        classifier_model, x_test, y_test, defense_gan, bs=4, device=device)
+    # 実際は防御なしなので、単純な精度計算で良い
     clean_acc = get_accuracy(classifier_model, x_test, y_test, bs=args.batch_size, device=device)
-    print(f"Clean accuracy (ViT classifier): {clean_acc:.4f}")
+    pred_clean = get_predictions(classifier_model, x_test, bs=args.batch_size, device=device)
+    print(f"Clean accuracy (ViT classifier only): {clean_acc:.4f}")
     results['clean_acc_classifier'] = clean_acc
     
-    # ========== 2. FGSM攻撃 & 敵対的画像の精度（防御なし） ==========
-    print("\n[2/3] Running FGSM attack and evaluating adversarial images...")
+    # ========== 2. クリーン画像を浄化した後の精度（防御あり） ==========
+    print("\n[2/4] Evaluating clean images with Defense-GAN purification...")
+    clean_purified_acc, pred_clean_purified = get_accuracy_and_predictions_with_defense(
+        classifier_model, x_test, y_test, defense_gan, bs=4, device=device)
+    print(f"Clean accuracy (with Defense-GAN): {clean_purified_acc:.4f}")
+    results['clean_acc_with_gan'] = clean_purified_acc
+    
+    # ========== 3. FGSM攻撃 & 敵対的画像の精度（防御なし） ==========
+    print("\n[3/4] Running FGSM attack and evaluating adversarial images...")
     start_time = time.time()
     x_adv = run_fgsm_attack(classifier_model, x_test, y_test, args.epsilon, device, args.batch_size)
     attack_time = time.time() - start_time
     
     adv_acc_no_defense = get_accuracy(classifier_model, x_adv, y_test, bs=args.batch_size, device=device)
+    pred_adv_no_def = get_predictions(classifier_model, x_adv, bs=args.batch_size, device=device)
     print(f"Adversarial accuracy (no defense): {adv_acc_no_defense:.4f}")
     results['adv_acc_no_defense'] = adv_acc_no_defense
     results['attack_time'] = attack_time
     
-    # ========== 3. 敵対的画像を浄化した後の精度（防御あり） ==========
-    print("\n[3/3] Evaluating adversarial images with Defense-GAN purification...")
+    # ========== 4. 敵対的画像を浄化した後の精度（防御あり） ==========
+    print("\n[4/4] Evaluating adversarial images with Defense-GAN purification...")
     adv_defended_acc, pred_adv_defended = get_accuracy_and_predictions_with_defense(
         classifier_model, x_adv, y_test, defense_gan, bs=4, device=device)
     print(f"Adversarial accuracy (with Defense-GAN): {adv_defended_acc:.4f}")
     results['adv_acc_with_gan'] = adv_defended_acc
+    
+    # 防御効果
+    defense_improvement = adv_defended_acc - adv_acc_no_defense
+    results['defense_improvement'] = defense_improvement
     
     # 防御効果
     defense_improvement = adv_defended_acc - adv_acc_no_defense
@@ -666,8 +682,9 @@ def main():
     print(f"Defense-GAN: rec_iters={args.rec_iters}, rec_lr={args.rec_lr}, rec_rr={args.rec_rr}")
     print(f"Note: Generator is trained on RGB images")
     print(f"-"*70)
-    print(f"Clean Accuracy:")
-    print(f"  ViT classifier only:       {results['clean_acc_classifier']:.4f}")
+    print(f"Clean Images:")
+    print(f"  Without defense:           {results['clean_acc_classifier']:.4f}")
+    print(f"  With Defense-GAN:          {results['clean_acc_with_gan']:.4f}")
     print(f"-"*70)
     print(f"Adversarial Accuracy (FGSM):")
     print(f"  Without defense:           {results['adv_acc_no_defense']:.4f}")
@@ -682,19 +699,16 @@ def main():
     print("Confusion Matrices")
     print(f"{'='*70}")
     
-    # 予測取得（Defense-GAN処理済みの予測は既に取得済み）
-    pred_clean = get_predictions(classifier_model, x_test, bs=args.batch_size, device=device)
-    pred_adv_no_def = get_predictions(classifier_model, x_adv, bs=args.batch_size, device=device)
-    # pred_clean_purified と pred_adv_defended は上で既に取得済み
-    
     y_true = y_test.cpu().numpy()
     
-    cm_clean = print_confusion_matrix(y_true, pred_clean, "1. Clean Images (ViT classifier only)", classes)
-    cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "2. Adversarial Images (No Defense)", classes)
-    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "3. Adversarial Images (with Defense-GAN)", classes)
+    cm_clean = print_confusion_matrix(y_true, pred_clean, "1. Clean Images (No Defense)", classes)
+    cm_clean_purified = print_confusion_matrix(y_true, pred_clean_purified, "2. Clean Images (with Defense-GAN)", classes)
+    cm_adv_no_def = print_confusion_matrix(y_true, pred_adv_no_def, "3. Adversarial Images (No Defense)", classes)
+    cm_adv_defended = print_confusion_matrix(y_true, pred_adv_defended, "4. Adversarial Images (with Defense-GAN)", classes)
     
     results['confusion_matrices'] = {
         'clean': cm_clean,
+        'clean_purified': cm_clean_purified,
         'adv_no_defense': cm_adv_no_def,
         'adv_defended': cm_adv_defended
     }
@@ -745,8 +759,9 @@ def main():
         f.write("RESULTS\n")
         f.write("-"*70 + "\n\n")
         
-        f.write("Clean Accuracy:\n")
-        f.write(f"  ViT classifier only:       {results['clean_acc_classifier']:.4f}\n\n")
+        f.write("Clean Images:\n")
+        f.write(f"  Without defense:           {results['clean_acc_classifier']:.4f}\n")
+        f.write(f"  With Defense-GAN:          {results['clean_acc_with_gan']:.4f}\n\n")
         
         f.write("Adversarial Accuracy (FGSM):\n")
         f.write(f"  Without defense:           {results['adv_acc_no_defense']:.4f}\n")
@@ -759,7 +774,8 @@ def main():
         f.write("CONFUSION MATRICES\n")
         f.write("-"*70 + "\n\n")
         
-        for name, cm in [("Clean (ViT Classifier)", cm_clean), 
+        for name, cm in [("Clean (No Defense)", cm_clean), 
+                         ("Clean (with Defense-GAN)", cm_clean_purified),
                          ("Adversarial (No Defense)", cm_adv_no_def),
                          ("Adversarial (with Defense-GAN)", cm_adv_defended)]:
             if cm:
@@ -775,6 +791,7 @@ def main():
         'classifier': 'ViT-B/16',
         'args': vars(args),
         'clean_acc_classifier': results['clean_acc_classifier'],
+        'clean_acc_with_gan': results['clean_acc_with_gan'],
         'adv_acc_no_defense': results['adv_acc_no_defense'],
         'adv_acc_with_gan': results['adv_acc_with_gan'],
         'defense_improvement': results['defense_improvement'],
