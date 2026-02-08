@@ -1,0 +1,70 @@
+======================================================================
+PGD Attack + DDPM Purification - Summary Statistics
+======================================================================
+
+Attack Parameters:
+  Method: PGD (Projected Gradient Descent)
+  Epsilon: 0.0314 (8.0/255)
+  Alpha: 0.0078 (2.0/255)
+  Steps: 10
+  Random Start: True
+
+Purification Parameters:
+  Method: DDPM (Denoising Diffusion Probabilistic Model)
+  Start timestep (t): 80
+  Purification steps: 50
+  Checkpoint: /mnt/data1/gotou/kaggle/ddpm/ddpm2_fgsm/ddpm_out/ddpm2_epoch10.pth
+
+----------------------------------------------------------------------
+Results (evaluated on 21587 correctly classified images):
+----------------------------------------------------------------------
+Clean Accuracy:      1.0000 (21587/21587)
+Adversarial Accuracy:0.0334 (720/21587)
+Purified Accuracy:   0.9313 (20103/21587)
+Defense Improvement: +0.8979
+Attack Success Rate: 0.9666
+Defense Success Rate:0.9289 (on attacked samples)
+
+======================================================================
+Perturbation Norms:
+======================================================================
+Adversarial Perturbations (vs Clean):
+  L2 norm:   mean=7.858489, std=0.195581
+             min=6.448300, max=8.152969
+             median=7.901288
+  L∞ norm:   mean=0.031373, std=0.000000
+             min=0.031371, max=0.031373
+             median=0.031373
+
+Purified Images (vs Clean):
+  L2 norm:   mean=13.197332, std=1.364207
+             min=3.142716, max=20.087036
+             median=13.507798
+  L∞ norm:   mean=0.209661, std=0.024191
+             min=0.038148, max=0.415757
+             median=0.206843
+
+======================================================================
+Confusion Matrix Statistics:
+======================================================================
+
+Clean Images:
+  TN: 12870  FP:    0  FN:    0  TP: 8717
+  Precision:   1.0000
+  Recall:      1.0000
+  F1-Score:    1.0000
+  Specificity: 1.0000
+
+Adversarial Images:
+  TN:   15  FP: 12855  FN: 8012  TP:  705
+  Precision:   0.0520
+  Recall:      0.0809
+  F1-Score:    0.0633
+  Specificity: 0.0012
+
+Purified Images:
+  TN: 12216  FP:  654  FN:  830  TP: 7887
+  Precision:   0.9234
+  Recall:      0.9048
+  F1-Score:    0.9140
+  Specificity: 0.9492

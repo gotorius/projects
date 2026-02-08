@@ -1,0 +1,13 @@
+======================================================================
+PCam - AutoAttack + JPEG Compression Defense
+======================================================================
+Attack version: standard
+Lp norm: Linf
+Epsilon: 0.03137254901960784
+JPEG quality: 11
+======================================================================
+ngpus: 2, adv_batch_size: 128
+
+Loading classifier...
+
+Loading data...

@@ -1,0 +1,29 @@
+# Deep Learning Framework
+torch>=2.0.0
+torchvision>=0.15.0
+pytorch-lightning>=2.0.0
+
+# Data Processing
+numpy>=1.24.0
+pandas>=2.0.0
+pillow>=9.5.0
+scikit-image>=0.21.0
+
+# Model Evaluation & Metrics
+scikit-learn>=1.3.0
+opencv-python>=4.8.0
+
+# Visualization & Notebooks
+matplotlib>=3.7.0
+seaborn>=0.12.0
+jupyter>=1.0.0
+ipython>=8.10.0
+
+# Utilities
+tqdm>=4.65.0
+python-dotenv>=1.0.0
+
+# Optional: for advanced techniques
+albumentations>=1.3.0  # 画像前処理・ augmentation
+timm>=0.9.0  # PyTorch Image Models
+wandb>=0.15.0  # Experiment tracking (optional)

@@ -1,0 +1,36 @@
+======================================================================
+PCam - AutoAttack + JPEG Compression Defense (Quality=11)
+======================================================================
+
+Dataset: PCam (Histopathologic Cancer Detection)
+Attack: AutoAttack (APGD-CE), epsilon=0.0314 (8.0/255)
+Defense: JPEG Compression, quality=11
+Classifier: /mnt/data1/gotou/projects/data/best_model_weights.pth
+
+----------------------------------------------------------------------
+Results on 21587 correctly classified images:
+----------------------------------------------------------------------
+Clean Accuracy:      1.0000
+Adversarial Accuracy:0.0000
+Compressed Accuracy: 0.8458
+Defense Improvement: +0.8458
+Attack Success Rate: 1.0000
+Defense Success Rate:0.8458
+
+----------------------------------------------------------------------
+Perturbation Norms:
+----------------------------------------------------------------------
+Adversarial Perturbations:
+  L2:   mean=8.2796, std=0.2403
+  L∞:   mean=0.0314, std=0.0000
+
+Compressed Images (vs Clean):
+  L2:   mean=17.5686, std=3.3368
+  L∞:   mean=0.2735, std=0.0359
+
+----------------------------------------------------------------------
+Confusion Matrix Metrics:
+----------------------------------------------------------------------
+Clean: Precision=1.0000, Recall=1.0000, F1=1.0000
+Adversarial: Precision=0.0000, Recall=0.0000, F1=0.0000
+Compressed: Precision=0.8804, Recall=0.7153, F1=0.7893

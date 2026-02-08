@@ -9,6 +9,9 @@ MedImages/
 *.npy
 *.gz
 *.tif
+*.png
+*.jpg
+*.jpeg
 
 # チェックポイント・モデル
 kaggledata/test/

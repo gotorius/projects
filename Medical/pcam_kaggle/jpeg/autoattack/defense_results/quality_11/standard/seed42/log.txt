@@ -1,0 +1,6 @@
+Log directory: /mnt/data1/gotou/projects/pcam/jpeg/autoattack/defense_results/quality_11/standard/seed42
+Attack version: standard
+JPEG Quality: 11
+Epsilon: 0.03137254901960784
+
+Preparing validation data...

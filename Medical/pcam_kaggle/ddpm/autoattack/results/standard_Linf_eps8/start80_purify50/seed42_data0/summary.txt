@@ -1,0 +1,45 @@
+======================================================================
+PCam - AutoAttack + DDPM Defense (Non-adaptive)
+======================================================================
+
+Attack: standard
+Attacks used: ['apgd-ce', 'apgd-t', 'fab-t', 'square']
+Norm: Linf, Epsilon: 0.0314
+DDPM: start_t=80, T_purify=50
+Samples: 500
+
+----------------------------------------------------------------------
+Clean Accuracy:
+  Classifier only:          0.9900
+  With DDPM purification:   0.9440
+
+Adversarial Accuracy:
+  Without defense:          0.0000
+  With DDPM purification:   0.9240
+  Defense improvement:      +0.9240
+
+----------------------------------------------------------------------
+Attack time: 138.04s
+======================================================================
+
+======================================================================
+Confusion Matrices
+======================================================================
+  [DDPMDefense] Forward pass #0
+
+Clean Images (Classifier):
+  TN:  295  FP:    4
+  FN:    1  TP:  200
+  Precision: 0.9804, Recall: 0.9950, F1: 0.9877
+
+Adversarial Images (No Defense):
+  TN:    0  FP:  299
+  FN:  201  TP:    0
+  Precision: 0.0000, Recall: 0.0000, F1: 0.0000
+
+Adversarial Images (DDPM Defense):
+  TN:  269  FP:   30
+  FN:   10  TP:  191
+  Precision: 0.8643, Recall: 0.9502, F1: 0.9052
+Saved 10 sample images to /mnt/data1/gotou/projects/pcam/ddpm/autoattack/results/standard_Linf_eps8/start80_purify50/seed42_data0/samples
+  Format: [Clean | Adversarial | Purified]

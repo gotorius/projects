@@ -1,0 +1,3 @@
+using standard version including apgd-ce, apgd-t, fab-t, square.
+Warning: with only 2 classes it is not possible to use the DLR loss! Also, it seems that too many target classes (9) are used in FAB-T (1 possible)!
+initial accuracy: 89.30%

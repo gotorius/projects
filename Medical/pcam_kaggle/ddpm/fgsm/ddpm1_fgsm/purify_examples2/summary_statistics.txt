@@ -1,0 +1,67 @@
+======================================================================
+FGSM Attack + DDPM Purification - Summary Statistics
+======================================================================
+
+Attack Parameters:
+  Method: FGSM (Fast Gradient Sign Method)
+  Epsilon: 0.0314 (8.0/255)
+
+Purification Parameters:
+  Method: DDPM (Denoising Diffusion Probabilistic Model)
+  Start timestep (t): 80
+  Purification steps: 50
+  Checkpoint: /mnt/data1/gotou/kaggle/ddpm/ddpm1_fgsm/ddpm_epoch10.pth
+
+----------------------------------------------------------------------
+Results (evaluated on 21587 correctly classified images):
+----------------------------------------------------------------------
+Clean Accuracy:      1.0000 (21587/21587)
+Adversarial Accuracy:0.5859 (12647/21587)
+Purified Accuracy:   0.8714 (18810/21587)
+Defense Improvement: +0.2855
+Attack Success Rate: 0.4141
+Defense Success Rate:0.6894 (on attacked samples)
+
+======================================================================
+Perturbation Norms:
+======================================================================
+Adversarial Perturbations (vs Clean):
+  L2 norm:   mean=11.637413, std=2.320054
+             min=0.000000, max=12.171907
+             median=12.148424
+  L∞ norm:   mean=0.030182, std=0.005994
+             min=0.000000, max=0.031373
+             median=0.031373
+
+Purified Images (vs Clean):
+  L2 norm:   mean=13.080024, std=1.532561
+             min=2.980520, max=18.981283
+             median=13.475181
+  L∞ norm:   mean=0.200326, std=0.022773
+             min=0.024532, max=0.378600
+             median=0.198370
+
+======================================================================
+Confusion Matrix Statistics:
+======================================================================
+
+Clean Images:
+  TN: 12870  FP:    0  FN:    0  TP: 8717
+  Precision:   1.0000
+  Recall:      1.0000
+  F1-Score:    1.0000
+  Specificity: 1.0000
+
+Adversarial Images:
+  TN: 8104  FP: 4766  FN: 4174  TP: 4543
+  Precision:   0.4880
+  Recall:      0.5212
+  F1-Score:    0.5040
+  Specificity: 0.6297
+
+Purified Images:
+  TN: 11103  FP: 1767  FN: 1010  TP: 7707
+  Precision:   0.8135
+  Recall:      0.8841
+  F1-Score:    0.8473
+  Specificity: 0.8627

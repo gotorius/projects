@@ -1,0 +1,68 @@
+======================================================================
+PGD Attack + JPEG Defense - Summary Statistics
+======================================================================
+
+Attack Parameters:
+  Method: PGD (Projected Gradient Descent)
+  Epsilon: 0.031373 (8.0/255)
+  Alpha: 0.007843 (2.0/255)
+  Steps: 10
+  Random Start: True
+
+Defense Parameters:
+  Method: JPEG Compression
+  Quality: 11
+
+----------------------------------------------------------------------
+Results (evaluated on 21587 correctly classified images):
+----------------------------------------------------------------------
+Clean Accuracy:      1.0000
+Adversarial Accuracy:0.0338
+Defended Accuracy:   0.8295
+Defense Improvement: +0.7957
+Attack Success Rate: 0.9662
+Defense Success Rate:0.8236 (on attacked samples)
+
+======================================================================
+Perturbation Norms:
+======================================================================
+Adversarial Perturbations (vs Clean):
+  L2 norm:   mean=7.858106, std=0.196718
+             min=6.427898, max=8.142021
+             median=7.900881
+  L∞ norm:   mean=0.031373, std=0.000000
+             min=0.031371, max=0.031373
+             median=0.031373
+
+Defended Images (vs Clean):
+  L2 norm:   mean=17.325243, std=3.321723
+             min=2.344562, max=23.274553
+             median=18.271830
+  L∞ norm:   mean=0.264559, std=0.033217
+             min=0.023529, max=0.478431
+             median=0.266667
+
+======================================================================
+Confusion Matrix Statistics:
+======================================================================
+
+Clean Images:
+  TN: 12870  FP:    0  FN:    0  TP: 8717
+  Precision:   1.0000
+  Recall:      1.0000
+  F1-Score:    1.0000
+  Specificity: 1.0000
+
+Adversarial Images:
+  TN:   12  FP: 12858  FN: 7999  TP:  718
+  Precision:   0.0529
+  Recall:      0.0824
+  F1-Score:    0.0644
+  Specificity: 0.0009
+
+Defended Images:
+  TN: 11883  FP:  987  FN: 2693  TP: 6024
+  Precision:   0.8592
+  Recall:      0.6911
+  F1-Score:    0.7660
+  Specificity: 0.9233

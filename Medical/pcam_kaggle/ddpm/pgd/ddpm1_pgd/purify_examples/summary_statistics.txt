@@ -1,0 +1,70 @@
+======================================================================
+PGD Attack + DDPM Purification - Summary Statistics
+======================================================================
+
+Attack Parameters:
+  Method: PGD (Projected Gradient Descent)
+  Epsilon: 0.0314 (8.0/255)
+  Alpha: 0.0078 (2.0/255)
+  Steps: 10
+  Random Start: True
+
+Purification Parameters:
+  Method: DDPM (Denoising Diffusion Probabilistic Model)
+  Start timestep (t): 80
+  Purification steps: 50
+  Checkpoint: /mnt/data1/gotou/kaggle/ddpm/ddpm1_fgsm/ddpm_epoch10.pth
+
+----------------------------------------------------------------------
+Results (evaluated on 21587 correctly classified images):
+----------------------------------------------------------------------
+Clean Accuracy:      1.0000 (21587/21587)
+Adversarial Accuracy:0.0330 (712/21587)
+Purified Accuracy:   0.9209 (19879/21587)
+Defense Improvement: +0.8879
+Attack Success Rate: 0.9670
+Defense Success Rate:0.9182 (on attacked samples)
+
+======================================================================
+Perturbation Norms:
+======================================================================
+Adversarial Perturbations (vs Clean):
+  L2 norm:   mean=7.859079, std=0.194957
+             min=6.460763, max=8.169550
+             median=7.901350
+  L∞ norm:   mean=0.031373, std=0.000000
+             min=0.031371, max=0.031373
+             median=0.031373
+
+Purified Images (vs Clean):
+  L2 norm:   mean=12.952402, std=1.524639
+             min=2.872519, max=18.921539
+             median=13.353540
+  L∞ norm:   mean=0.199793, std=0.022620
+             min=0.024712, max=0.363034
+             median=0.197849
+
+======================================================================
+Confusion Matrix Statistics:
+======================================================================
+
+Clean Images:
+  TN: 12870  FP:    0  FN:    0  TP: 8717
+  Precision:   1.0000
+  Recall:      1.0000
+  F1-Score:    1.0000
+  Specificity: 1.0000
+
+Adversarial Images:
+  TN:   16  FP: 12854  FN: 8021  TP:  696
+  Precision:   0.0514
+  Recall:      0.0798
+  F1-Score:    0.0625
+  Specificity: 0.0012
+
+Purified Images:
+  TN: 11720  FP: 1150  FN:  558  TP: 8159
+  Precision:   0.8765
+  Recall:      0.9360
+  F1-Score:    0.9052
+  Specificity: 0.9106

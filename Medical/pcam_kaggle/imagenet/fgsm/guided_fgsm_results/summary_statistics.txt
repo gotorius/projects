@@ -1,0 +1,77 @@
+gotou@takemoto14:/mnt/data1/gotou/projects/pcam/imagenet/fgsm$ python image_fgsm.py                                                                    
+Loading classifier...                                                                                                                                  
+/home/gotou/miniconda3/envs/env/lib/python3.10/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated si
+nce 0.13 and may be removed in the future, please use 'weights' instead.                                                                               
+  warnings.warn(                                                                                                                                       
+/home/gotou/miniconda3/envs/env/lib/python3.10/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None
+` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=None`.              
+  warnings.warn(msg)                                                                                                                                   
+Loading guided diffusion model...                                                                                                                      
+Starting evaluation with FGSM (eps=0.0314) and Guided Diffusion Purification (start_t=80, steps=50)...                                                 
+100%|████████████████████████████████████████████████████████████████| 1376/1376 [27:42:32<00:00, 72.49s/it]     
+
+
+======================================================================
+FGSM + Guided Diffusion Purification - Summary Statistics
+======================================================================
+
+Clean Accuracy:      1.0000
+Adversarial Accuracy:0.5858
+Purified Accuracy:   0.7314
+Defense Improvement: +0.1456
+
+
+======================================================================                                                                                 
+==== Results (Clean Images Only - FGSM) ====                                                                                                           
+======================================================================                                                                                 
+Total samples evaluated: 21587                                                                                                                         
+Attack: FGSM with epsilon=0.0314                                                                                                                       
+Purification: Guided Diffusion start_t=80, steps=50                                                                                                    
+----------------------------------------------------------------------                                                                                 
+Clean accuracy:     1.0000                                                                                                                             
+Adv (FGSM) accuracy:0.5858                                                                                                                             
+Purified accuracy:  0.7314                                                                                                                             
+Defense improvement: +0.1456                                                                                                                           
+----------------------------------------------------------------------                                                                                 
+                                                                                                                                                       
+======================================================================                                                                                 
+==== Perturbation Norms ====                                                                                                                           
+======================================================================                                                                                 
+Adversarial Perturbations (vs Clean):                                                                                                                  
+  L2 norm:   mean=11.6374, std=2.3201, min=0.0000, max=12.1719                                                                                         
+  L∞ norm:   mean=0.0302, std=0.0060, min=0.0000, max=0.0314                                                                                           
+
+Purified Images (vs Clean):                                                
+  L2 norm:   mean=14.0122, std=2.8061, min=2.3865, max=18.0413                                                                                         
+  L∞ norm:   mean=0.2486, std=0.0355, min=0.0292, max=0.4254          
+======================================================================                                                                                 
+
+Clean Confusion Matrix:              
+                Predicted            
+                Normal  Tumor                                              
+  Actual Normal   12870      0                                             
+         Tumor        0   8717                                             
+  Precision: 1.0000                  
+  Recall:    1.0000                  
+  F1-Score:  1.0000                  
+
+Adversarial Confusion Matrix:                                              
+                Predicted            
+                Normal  Tumor                                              
+  Actual Normal    8104   4766                                             
+         Tumor     4176   4541                                             
+  Precision: 0.4879                  
+  Recall:    0.5209                  
+  F1-Score:  0.5039                  
+
+Purified Confusion Matrix:           
+                Predicted            
+                Normal  Tumor                                              
+  Actual Normal   10112   2758                                             
+         Tumor     3041   5676                                             
+  Precision: 0.6730                  
+  Recall:    0.6511                  
+  F1-Score:  0.6619                  
+✅ Summary statistics saved to: guided_fgsm_results/summary_statistics.txt                                                                             
+gotou@takemoto14:/mnt/data1/gotou/projects/pcam/imagenet/fgsm$ 
+[2] 0:[tmux]*                                                              
