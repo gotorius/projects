@@ -48,3 +48,28 @@ __pycache__/
 /mnt/data1/gotou/projects/Medical/diffusion/data/
 dp/data/
 
+*.png
+*.jpg
+*.jpeg
+*.txt
+
+
+# データセット
+imagenet-256/
+*.json
+# 学習済みモデル
+*.pth
+# ログ・一時ファイル
+*.csv
+*.txt
+*.png
+*.tif
+*.npz
+
+# Jupyterのチェックポイント
+.ipynb_checkpoints/
+# Pythonキャッシュ
+__pycache__/
+*.pyc
+# VSCode設定
+.vscode/
